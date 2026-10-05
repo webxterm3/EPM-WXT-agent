@@ -63,6 +63,14 @@ type Agent struct {
 	fsOps              *filesystem.Operations
 	portForward        *portforward.Manager
 	remoteControl      *remotecontrol.Controller
+	// configPath is where the agent's own config file lives, so settings
+	// pushed from the portal can be written back and survive a restart.
+	configPath string
+
+	// logShip owns the system-log collector's lifetime, so settings can be
+	// changed from the portal without restarting the agent.
+	logShip logShipRunner
+
 	// certMu serialises all cert and CA file operations.
 	// Prevents concurrent CA rotation paths (gRPC in-band + polling recovery)
 	// from racing on the same on-disk files.
@@ -154,6 +162,10 @@ func (a *Agent) Start(ctx context.Context) error {
 	// after agentID is known from the first successful registration.
 	var tunnelOnce sync.Once
 
+	// logShipOnce does the same for system-log collection, which also needs the
+	// agentID before it can tell the backend whose logs these are.
+	var logShipOnce sync.Once
+
 	// Reconnection loop with exponential backoff
 	retryDelay := 5 * time.Second
 	maxRetryDelay := 60 * time.Second
@@ -235,6 +247,11 @@ func (a *Agent) Start(ctx context.Context) error {
 					zap.String("machine_id", a.agentID))
 			})
 		}
+
+		// Log shipping is deliberately scoped to ctx, not the connection: an
+		// offline machine keeps collecting and ships the backlog on reconnect,
+		// so an outage does not become a hole in the archive.
+		logShipOnce.Do(func() { a.startLogShipping(ctx) })
 
 		// heartbeatLoop and certRenewalLoop are scoped to the connection lifecycle.
 		// certRenewalLoop must NOT run while offline — cert operations require a working
@@ -1132,6 +1149,13 @@ func (a *Agent) handleCommand(cmd *agentv1.CommandRequest) error {
 	// panic guard so a failed update can never crash the running agent.
 	if cmd.CommandId == "__vsay_update__" {
 		go a.handleSelfUpdate(cmd.Command)
+		return nil
+	}
+
+	// "__vsay_logship__" carries system-log collection settings from the
+	// portal. cmd.Command is a JSON LogShippingConfig.
+	if cmd.CommandId == LogShipCommandID {
+		go a.handleLogShipConfig(cmd.Command)
 		return nil
 	}
 

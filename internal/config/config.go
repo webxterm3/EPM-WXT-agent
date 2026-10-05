@@ -26,6 +26,7 @@ type Config struct {
 	Permissions PermissionsConfig `yaml:"permissions"`
 	HostEntries []HostEntry       `yaml:"host_entries,omitempty"`
 	Logging     LoggingConfig     `yaml:"logging"`
+	LogShipping LogShippingConfig `yaml:"log_shipping"`
 	Status      string            `yaml:"status"`
 }
 
@@ -93,6 +94,52 @@ type PermissionsConfig struct {
 type HostEntry struct {
 	IP     string `yaml:"ip"`
 	Domain string `yaml:"domain"`
+}
+
+// LogShippingConfig controls collection of the MACHINE's own logs — the
+// Windows Event Log, the macOS unified log and website activity — as opposed
+// to LoggingConfig, which is about the agent's own diagnostic output.
+//
+// It is off unless enabled. Collecting a fleet's system logs is an explicit
+// decision with a real bandwidth and storage cost, and it is not something an
+// agent upgrade should silently start doing to machines already in the field.
+// The json tags are load-bearing, not decoration: these settings arrive from
+// the portal as JSON over the gRPC command channel. Without them encoding/json
+// cannot match "system_logs" to SystemLogs — the underscore defeats its
+// case-insensitive fallback — and every field but Enabled would silently
+// decode to its zero value.
+type LogShippingConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// SystemLogs collects the platform's own log.
+	SystemLogs bool `yaml:"system_logs" json:"system_logs"`
+
+	// Websites collects domain-level browsing activity, derived from DNS.
+	Websites bool `yaml:"websites" json:"websites"`
+
+	// IntervalSeconds is how often sources are polled. Zero uses the default.
+	IntervalSeconds int `yaml:"interval_seconds" json:"interval_seconds"`
+
+	// DailyBudgetMB caps compressed upload per machine per day. Zero uses the
+	// default; a negative value means no limit, which should only be set on a
+	// machine somebody is watching.
+	DailyBudgetMB int `yaml:"daily_budget_mb" json:"daily_budget_mb"`
+
+	// BackfillHours bounds how far back the first run reads, so enabling this
+	// on an old machine does not ship its entire retained history at once.
+	BackfillHours int `yaml:"backfill_hours" json:"backfill_hours"`
+
+	// IncludeInfoDebug collects info- and debug-level records. This can change
+	// a machine's daily volume by an order of magnitude — on macOS the unified
+	// log at info level is most of what the OS writes.
+	IncludeInfoDebug bool `yaml:"include_info_debug" json:"include_info_debug"`
+
+	// KeepRaw stores each record's original structured form, roughly doubling
+	// volume. Errors and criticals keep theirs regardless.
+	KeepRaw bool `yaml:"keep_raw" json:"keep_raw"`
+
+	// WindowsChannels overrides the default Event Log channel set.
+	WindowsChannels []string `yaml:"windows_channels,omitempty" json:"windows_channels,omitempty"`
 }
 
 type LoggingConfig struct {

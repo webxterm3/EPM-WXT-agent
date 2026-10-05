@@ -833,6 +833,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create agent: %w", err)
 	}
 
+	// Settings pushed from the portal are written back here, so they survive a
+	// restart rather than reverting silently.
+	agt.SetConfigPath(configPath)
+
 	// Start agent
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
