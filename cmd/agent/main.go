@@ -827,10 +827,21 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// reported to the backend in register metadata (for self-update).
 	agent.BuildVersion = version
 
+	// Anything that goes wrong from here on is reported through the logger
+	// before it is returned. Returning it alone sends it to cobra, which hands
+	// it to log.Fatal and so to stderr — and a Windows scheduled task running as
+	// SYSTEM has no stderr. That is why a crashing agent left a log file ending
+	// mid-startup with no reason given, restarting every few minutes.
+	fail := func(err error) error {
+		logger.Error("Agent stopped", zap.Error(err))
+		_ = logger.Sync()
+		return err
+	}
+
 	// Create agent
 	agt, err := agent.New(cfg, logger)
 	if err != nil {
-		return fmt.Errorf("failed to create agent: %w", err)
+		return fail(fmt.Errorf("failed to create agent: %w", err))
 	}
 
 	// Settings pushed from the portal are written back here, so they survive a
@@ -854,7 +865,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 
 	select {
 	case err := <-errChan:
-		return fmt.Errorf("agent error: %w", err)
+		return fail(fmt.Errorf("agent error: %w", err))
 	case sig := <-sigChan:
 		logger.Info("Received signal, shutting down", zap.String("signal", sig.String()))
 		cancel()

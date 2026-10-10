@@ -8,7 +8,13 @@ import (
 	"strconv"
 
 	"go.uber.org/zap"
+
+	"github.com/Yesveer/wxt-agent/internal/osuser"
 )
+
+// defaultShell is the shell commands are run through. Linux and macOS both
+// have it; on Windows this executor path is not used.
+const defaultShell = "/bin/bash"
 
 // Executor handles command execution as a specific Linux user
 type Executor struct {
@@ -22,106 +28,63 @@ type Executor struct {
 	userExists bool
 }
 
-// New creates a new executor for the given username
-func New(username string, allowSudo bool, logger *zap.Logger) (*Executor, error) {
+// New creates an executor for the given username.
+//
+// homeDir is the working directory recorded at configure time. It is a
+// fallback, used only when the account cannot be resolved locally.
+func New(username string, allowSudo bool, homeDir string, logger *zap.Logger) (*Executor, error) {
 	e := &Executor{
 		username:  username,
 		allowSudo: allowSudo,
 		logger:    logger,
 	}
 
-	// Check if user exists
-	u, err := user.Lookup(username)
-	if err != nil {
-		// User doesn't exist, we'll need to create it
-		e.userExists = false
+	u, err := osuser.Lookup(username)
+	if err != nil && osuser.Provisionable() {
 		e.logger.Info("User does not exist, will be created", zap.String("username", username))
-
-		// Create the user
-		if err := e.createUser(); err != nil {
-			return nil, fmt.Errorf("failed to create user: %w", err)
+		if cerr := e.createUser(); cerr != nil {
+			return nil, fmt.Errorf("failed to create user: %w", cerr)
 		}
-
-		// Lookup again after creation
-		u, err = user.Lookup(username)
+		u, err = osuser.Lookup(username)
 		if err != nil {
 			return nil, fmt.Errorf("failed to lookup user after creation: %w", err)
 		}
-	} else {
-		e.userExists = true
-		e.logger.Info("User already exists", zap.String("username", username))
 	}
 
-	// Parse UID and GID
+	if err != nil {
+		// Not fatal, deliberately. On Windows and macOS this account belongs to
+		// the person using the laptop; the agent neither creates it nor runs
+		// commands as it — setUserCredentials is a no-op on Windows. Refusing to
+		// start because a name could not be resolved took a cosmetic detail and
+		// turned it into "the machine never appears in the portal", which is
+		// exactly what it did on every Entra-joined laptop.
+		e.logger.Warn("Could not resolve the configured account; continuing without it",
+			zap.String("username", username),
+			zap.String("consequence", "command execution as this user is unavailable; registration, monitoring and remote access are not affected"),
+			zap.Error(err))
+		e.userExists = false
+		e.homeDir = homeDir
+		e.shell = defaultShell
+		return e, nil
+	}
+
+	e.userExists = true
+	e.logger.Info("User already exists", zap.String("username", username))
+
+	// Parse UID and GID. These are POSIX ids; on Windows os/user returns SIDs,
+	// which do not parse, and nothing on that platform reads them.
 	uid, _ := strconv.Atoi(u.Uid)
 	gid, _ := strconv.Atoi(u.Gid)
 
 	e.uid = uid
 	e.gid = gid
 	e.homeDir = u.HomeDir
-	e.shell = "/bin/bash" // Default shell
+	if e.homeDir == "" {
+		e.homeDir = homeDir
+	}
+	e.shell = defaultShell
 
 	return e, nil
-}
-
-// createUser creates a new Linux user
-func (e *Executor) createUser() error {
-	e.logger.Info("Creating user", zap.String("username", e.username))
-
-	// Create user with home directory
-	// useradd -m -s /bin/bash <username>
-	cmd := exec.Command("useradd", "-m", "-s", "/bin/bash", e.username) // #nosec G204 -- argv-slice form, no shell involved
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("useradd failed: %w, output: %s", err, string(output))
-	}
-
-	e.logger.Info("User created successfully", zap.String("username", e.username))
-
-	// Add to sudo group if requested
-	if e.allowSudo {
-		if err := e.grantSudoAccess(); err != nil {
-			e.logger.Warn("Failed to grant sudo access", zap.Error(err))
-			// Don't fail, just log warning
-		}
-	}
-
-	return nil
-}
-
-// grantSudoAccess adds the user to the sudo group
-func (e *Executor) grantSudoAccess() error {
-	e.logger.Info("Granting sudo access", zap.String("username", e.username))
-
-	// Try different sudo group names depending on the distro
-	sudoGroups := []string{"sudo", "wheel"}
-
-	for _, group := range sudoGroups {
-		// Check if group exists
-		if _, err := user.LookupGroup(group); err != nil {
-			continue
-		}
-
-		// usermod -aG <group> <username>
-		cmd := exec.Command("usermod", "-aG", group, e.username) // #nosec G204 -- argv-slice form, no shell involved
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			e.logger.Warn("Failed to add to group",
-				zap.String("group", group),
-				zap.Error(err),
-				zap.String("output", string(output)),
-			)
-			continue
-		}
-
-		e.logger.Info("User added to sudo group",
-			zap.String("username", e.username),
-			zap.String("group", group),
-		)
-		return nil
-	}
-
-	return fmt.Errorf("no sudo group found (tried: %v)", sudoGroups)
 }
 
 // Execute runs a command as the configured user
@@ -229,7 +192,7 @@ type ExecutionResult struct {
 
 // CheckSudoAccess checks if the user has sudo access
 func CheckSudoAccess(username string) bool {
-	u, err := user.Lookup(username)
+	u, err := osuser.Lookup(username)
 	if err != nil {
 		return false
 	}

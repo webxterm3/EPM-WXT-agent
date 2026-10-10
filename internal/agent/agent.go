@@ -32,6 +32,7 @@ import (
 	"github.com/Yesveer/wxt-agent/internal/filesystem"
 	"github.com/Yesveer/wxt-agent/internal/grpc"
 	"github.com/Yesveer/wxt-agent/internal/monitor"
+	"github.com/Yesveer/wxt-agent/internal/osuser"
 	"github.com/Yesveer/wxt-agent/internal/portforward"
 	"github.com/Yesveer/wxt-agent/internal/pty"
 	"github.com/Yesveer/wxt-agent/internal/remotecontrol"
@@ -85,7 +86,8 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 	}
 
 	// Create executor (will create user if needed)
-	exec, err := executor.New(cfg.LinuxUser.Username, cfg.Permissions.AllowSudo, logger)
+	exec, err := executor.New(cfg.LinuxUser.Username, cfg.Permissions.AllowSudo,
+		cfg.LinuxUser.HomeDir, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create executor: %w", err)
 	}
@@ -263,6 +265,9 @@ func (a *Agent) Start(ctx context.Context) error {
 		go a.startSessionMonitor(heartbeatCtx)
 		// Report the agent process's own resource usage for the Agent Monitoring UI.
 		go a.agentStatsLoop(heartbeatCtx)
+		// Report the machine's installed software, which application-control
+		// policy is written against.
+		go a.appInventoryLoop(heartbeatCtx)
 
 		// Start gRPC stream (blocks until disconnection)
 		streamErr := a.streamLoop(ctx)
@@ -2057,9 +2062,22 @@ func (a *Agent) handleFilesystemOperation(sessionID string, msg map[string]inter
 // Helper functions
 
 func (a *Agent) getLinuxUserInfo() (*agentv1.LinuxUserInfo, error) {
-	u, err := user.Lookup(a.config.LinuxUser.Username)
+	u, err := osuser.Lookup(a.config.LinuxUser.Username)
 	if err != nil {
-		return nil, err
+		// Registration does not depend on resolving this account, and must not:
+		// on an Entra-joined Windows laptop the lookup fails for a name that is
+		// perfectly valid, and returning the error here meant the machine never
+		// appeared in the portal at all. Report what the config says instead.
+		a.logger.Warn("Could not resolve the configured account; registering with the configured details",
+			zap.String("username", a.config.LinuxUser.Username),
+			zap.Error(err))
+		info := a.executor.GetUserInfo()
+		return &agentv1.LinuxUserInfo{
+			Username: info.Username,
+			Groups:   []string{},
+			HomeDir:  info.HomeDir,
+			Shell:    info.Shell,
+		}, nil
 	}
 
 	// Get groups
