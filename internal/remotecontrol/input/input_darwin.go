@@ -14,6 +14,26 @@ static int wxt_input_trusted(void) {
 	return AXIsProcessTrusted() ? 1 : 0;
 }
 
+// wxt_input_request asks for the Accessibility right WITH the system prompt.
+//
+// Checking (above) answers the question and registers nothing. ASKING is what
+// puts this binary into System Settings › Privacy & Security › Accessibility
+// in the first place — so without this call the list never mentions us and
+// somebody has to know to press "+" and find a binary under /usr/local/bin.
+//
+// macOS shows the prompt at most once per process and rate-limits it itself,
+// so calling this when a session starts cannot become nagging.
+static int wxt_input_request(void) {
+	CFStringRef keys[] = { kAXTrustedCheckOptionPrompt };
+	CFBooleanRef values[] = { kCFBooleanTrue };
+	CFDictionaryRef options = CFDictionaryCreate(NULL,
+		(const void **)keys, (const void **)values, 1,
+		&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	int trusted = AXIsProcessTrustedWithOptions(options) ? 1 : 0;
+	CFRelease(options);
+	return trusted;
+}
+
 static void wxt_post_mouse(int type, double x, double y, int button, uint64_t flags) {
 	CGEventRef e = CGEventCreateMouseEvent(NULL, (CGEventType)type,
 		CGPointMake(x, y), (CGMouseButton)button);
@@ -72,15 +92,14 @@ import (
 	"unsafe"
 
 	"github.com/Yesveer/wxt-agent/internal/remotecontrol/rfb"
+	"github.com/Yesveer/wxt-agent/internal/remotecontrol/tcc"
 )
 
 // ErrAccessibilityDenied means macOS will not let this process synthesise
 // input. Like the Screen Recording grant it is a one-time user action, and it
 // gets its own error because CGEventPost fails silently — a session would
 // otherwise look perfectly healthy while ignoring every click.
-var ErrAccessibilityDenied = errors.New(
-	"macOS denied input control — grant Accessibility to wxt-agent in " +
-		"System Settings › Privacy & Security › Accessibility, then restart the agent")
+var ErrAccessibilityDenied = errors.New(tcc.DeniedMessage("Accessibility", "input control"))
 
 // CGEventType values.
 const (
@@ -333,3 +352,17 @@ func cbool(b bool) C.int {
 	}
 	return 0
 }
+
+// AccessibilityTrusted reports whether THIS process may synthesise input.
+//
+// Exported so the diagnostic can ask the only question that matters, from the
+// only process that can answer it: a switched-on row in System Settings proves
+// a row exists, not that it applies to the binary now asking.
+func AccessibilityTrusted() bool { return C.wxt_input_trusted() != 0 }
+
+// RequestAccessibility asks for the right, which is what registers this binary
+// in System Settings if it is not listed yet.
+//
+// The answer is almost always false on a first run — the prompt opens the door
+// to the setting, it does not grant anything. The ENTRY is the point.
+func RequestAccessibility() bool { return C.wxt_input_request() != 0 }

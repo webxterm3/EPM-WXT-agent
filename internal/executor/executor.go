@@ -30,6 +30,12 @@ type Executor struct {
 
 // New creates an executor for the given username.
 //
+// It never creates the account. The accounts on a managed endpoint are the
+// company's — made by its directory, its MDM or its IT team — and a monitoring
+// agent inventing a new local login on every machine it lands on is a change
+// nobody asked for and nobody can see. This product enables and disables access
+// for accounts that already exist; it does not provision them.
+//
 // homeDir is the working directory recorded at configure time. It is a
 // fallback, used only when the account cannot be resolved locally.
 func New(username string, allowSudo bool, homeDir string, logger *zap.Logger) (*Executor, error) {
@@ -40,24 +46,12 @@ func New(username string, allowSudo bool, homeDir string, logger *zap.Logger) (*
 	}
 
 	u, err := osuser.Lookup(username)
-	if err != nil && osuser.Provisionable() {
-		e.logger.Info("User does not exist, will be created", zap.String("username", username))
-		if cerr := e.createUser(); cerr != nil {
-			return nil, fmt.Errorf("failed to create user: %w", cerr)
-		}
-		u, err = osuser.Lookup(username)
-		if err != nil {
-			return nil, fmt.Errorf("failed to lookup user after creation: %w", err)
-		}
-	}
-
 	if err != nil {
-		// Not fatal, deliberately. On Windows and macOS this account belongs to
-		// the person using the laptop; the agent neither creates it nor runs
-		// commands as it — setUserCredentials is a no-op on Windows. Refusing to
-		// start because a name could not be resolved took a cosmetic detail and
-		// turned it into "the machine never appears in the portal", which is
-		// exactly what it did on every Entra-joined laptop.
+		// Not fatal, deliberately. Nothing the endpoint actually does needs
+		// this account resolved: input and capture run in the user's own
+		// session, and on Windows setUserCredentials is a no-op. Refusing to
+		// start over a name turns a cosmetic detail into "the machine never
+		// appears in the portal".
 		e.logger.Warn("Could not resolve the configured account; continuing without it",
 			zap.String("username", username),
 			zap.String("consequence", "command execution as this user is unavailable; registration, monitoring and remote access are not affected"),
@@ -69,7 +63,7 @@ func New(username string, allowSudo bool, homeDir string, logger *zap.Logger) (*
 	}
 
 	e.userExists = true
-	e.logger.Info("User already exists", zap.String("username", username))
+	e.logger.Info("Using existing account", zap.String("username", username))
 
 	// Parse UID and GID. These are POSIX ids; on Windows os/user returns SIDs,
 	// which do not parse, and nothing on that platform reads them.

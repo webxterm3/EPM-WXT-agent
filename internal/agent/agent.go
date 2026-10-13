@@ -76,6 +76,20 @@ type Agent struct {
 	// Prevents concurrent CA rotation paths (gRPC in-band + polling recovery)
 	// from racing on the same on-disk files.
 	certMu sync.Mutex
+
+	// inventoryScanNow carries "scan your software now" from the portal to the
+	// inventory loop. Buffered to one so a burst of clicks coalesces into a
+	// single scan; see requestInventoryScan.
+	inventoryScanNow chan struct{}
+
+	// inventoryLastScan is when a scan last finished. It outlives the
+	// inventory loop, which is restarted on every reconnect, so a machine on a
+	// flaky network does not re-scan each time it comes back.
+	inventoryMu       sync.Mutex
+	inventoryLastScan time.Time
+
+	// policies holds the application-control policy this machine is under.
+	policies *policyStore
 }
 
 // New creates a new agent
@@ -102,13 +116,14 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 	fsOps := filesystem.NewOperations(logger)
 
 	agent := &Agent{
-		config:          cfg,
-		logger:          logger,
-		executor:        exec,
-		monitor:         mon,
-		ptyHandler:      ptyHandler,
-		vscodeProcesses: make(map[string]*osExec.Cmd),
-		fsOps:           fsOps,
+		config:           cfg,
+		logger:           logger,
+		executor:         exec,
+		monitor:          mon,
+		ptyHandler:       ptyHandler,
+		vscodeProcesses:  make(map[string]*osExec.Cmd),
+		fsOps:            fsOps,
+		inventoryScanNow: make(chan struct{}, 1),
 	}
 
 	// Create port forwarding manager with send function
@@ -138,6 +153,19 @@ func (a *Agent) Start(ctx context.Context) error {
 		zap.String("linux_user", a.config.LinuxUser.Username),
 		zap.String("server", a.config.Server.Host),
 	)
+
+	// The agent deliberately does NOT ask macOS for Screen Recording or
+	// Accessibility.
+	//
+	// It was made to ask, so that both binaries would be listed together. That
+	// was a mistake: the agent captures nothing and moves no pointer — the
+	// session helper does both — so its entry grants nothing. Two rows where
+	// only one does anything means somebody switches one on, sees the other
+	// still off, and cannot tell whether they have finished. One row that
+	// works is clearer than two where one is decoration.
+	//
+	// The helper asks for itself, at the moment a session starts. See
+	// cmd/session-helper.
 
 	// One-time migration: encrypt any leftover plaintext .pem files from older agent versions.
 	a.migrateToEncryptedCerts()
@@ -1161,6 +1189,21 @@ func (a *Agent) handleCommand(cmd *agentv1.CommandRequest) error {
 	// portal. cmd.Command is a JSON LogShippingConfig.
 	if cmd.CommandId == LogShipCommandID {
 		go a.handleLogShipConfig(cmd.Command)
+		return nil
+	}
+
+	// "__vsay_inventory_scan__" asks for a software scan now rather than at
+	// the next scheduled one. It carries no payload: the request IS the whole
+	// message.
+	if cmd.CommandId == InventoryScanCommandID {
+		a.requestInventoryScan()
+		return nil
+	}
+
+	// "__vsay_apppolicy__" carries this machine's resolved application-control
+	// policy. cmd.Command is a JSON apppolicy.Effective.
+	if cmd.CommandId == AppPolicyCommandID {
+		go a.handleAppPolicy(cmd.Command)
 		return nil
 	}
 

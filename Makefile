@@ -86,27 +86,132 @@ build-linux: proto ## Build for Linux (amd64, arm64)
 	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o $(BIN_DIR)/linux-arm64/wxt-agent ./cmd/agent
 	@echo "  ✓ linux-arm64"
 
+# check_embedded_helper <built-helper> — the embedded copy must be byte-identical.
+#
+# Checked at the one moment it can be: after the agent is built and before the
+# slot is reset. The agent writes its embedded helper out at runtime whenever
+# the file on disk differs, so a mismatch here means every agent start
+# overwrites the installed helper, changes its code identity, and invalidates
+# the macOS permission grants — a permission that is granted, verified as
+# granted, and refused again minutes later.
+#
+# It is a hard failure. The build that produces it looks perfectly fine and
+# ships a product whose remote control cannot be permitted.
+define check_embedded_helper
+	@if ! cmp -s "$(EMBED_SLOT)" "$(1)"; then \
+		echo ""; \
+		echo "  ✗ the embedded session helper differs from $(1)"; \
+		echo "    The agent would rewrite the installed helper on every start,"; \
+		echo "    invalidating its macOS permission grants."; \
+		echo "    Sign the helper BEFORE copying it into the embed slot."; \
+		exit 1; \
+	fi
+endef
+
+# sign_macos_binary <path> — ad-hoc unless MACOS_SIGN_ID names a real identity.
+#
+# Called inline rather than as one pass at the end, because WHEN a binary is
+# signed matters: the session helper must be signed BEFORE it is embedded into
+# the agent. See the comment in build-macos.
+define sign_macos_binary
+	@opts=""; [ "$(MACOS_SIGN_ID)" = "-" ] || opts="--options runtime"; \
+	codesign --force --timestamp=none $$opts \
+		--identifier "$(MACOS_BUNDLE_PREFIX).$(notdir $(1))" \
+		--sign "$(MACOS_SIGN_ID)" "$(1)" >/dev/null 2>&1 \
+		|| echo "  ✗ $(1) — codesign failed (macOS + Xcode CLT required)"
+endef
+
 build-macos: proto ## Build for macOS (amd64, arm64)
 	@echo "Building for macOS..."
 	@mkdir -p $(BIN_DIR)/darwin-amd64 $(BIN_DIR)/darwin-arm64
+	@# BOTH binaries are built with cgo on macOS, and HELPER_LDFLAGS (no
+	@# -static) is used for both — Apple ships no static crt0.o.
+	@#
+	@# The agent needs cgo for two things that are only reachable through C:
+	@# registering itself in System Settings › Privacy & Security, and reading
+	@# CPU times. Built without it, neither fails loudly — the agent simply
+	@# never appears in the permission lists, and CPU reads 0% forever. Both
+	@# have a fallback for safety, but the fallback is not the plan.
+	@#
 	@# The session helper MUST be built with cgo: screen capture is
 	@# ScreenCaptureKit, input is CGEvent and the clipboard is NSPasteboard,
 	@# none of which exist without it. Cross-arch therefore needs an explicit
 	@# -arch for the C compiler, and both builds need macOS + Xcode CLT.
-	@# Helper first, then embedded into the agent for the same arch.
+	@# Helper first, SIGNED, and only then embedded into the agent.
+	@#
+	@# The order is load-bearing. The agent carries the helper inside itself
+	@# and writes it out at runtime when the file on disk differs. Sign the
+	@# helper AFTER embedding and the two copies differ for ever: every start
+	@# rewrites /usr/local/bin/wxt-agent-session with the embedded one, the
+	@# binary's code identity changes, and macOS treats the Accessibility and
+	@# Screen Recording grants as belonging to a program that no longer
+	@# exists. The symptom is a permission that is granted, verified as
+	@# granted, and refused again a minute later.
 	@CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CGO_CFLAGS="-arch x86_64" CGO_LDFLAGS="-arch x86_64" \
 		go build $(HELPER_LDFLAGS) -o $(BIN_DIR)/darwin-amd64/wxt-agent-session ./cmd/session-helper
-	@echo "  ✓ darwin-amd64 session helper"
+	$(call sign_macos_binary,$(BIN_DIR)/darwin-amd64/wxt-agent-session)
+	@echo "  ✓ darwin-amd64 session helper (signed)"
 	@cp $(BIN_DIR)/darwin-amd64/wxt-agent-session $(EMBED_SLOT)
-	@CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $(LDFLAGS) -o $(BIN_DIR)/darwin-amd64/wxt-agent ./cmd/agent
-	@echo "  ✓ darwin-amd64 (helper embedded)"
+	@CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CGO_CFLAGS="-arch x86_64" CGO_LDFLAGS="-arch x86_64" \
+		go build $(HELPER_LDFLAGS) -o $(BIN_DIR)/darwin-amd64/wxt-agent ./cmd/agent
+	$(call sign_macos_binary,$(BIN_DIR)/darwin-amd64/wxt-agent)
+	$(call check_embedded_helper,$(BIN_DIR)/darwin-amd64/wxt-agent-session)
+	@echo "  ✓ darwin-amd64 (signed, helper embedded, verified)"
 	@CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CGO_CFLAGS="-arch arm64" CGO_LDFLAGS="-arch arm64" \
 		go build $(HELPER_LDFLAGS) -o $(BIN_DIR)/darwin-arm64/wxt-agent-session ./cmd/session-helper
-	@echo "  ✓ darwin-arm64 session helper"
+	$(call sign_macos_binary,$(BIN_DIR)/darwin-arm64/wxt-agent-session)
+	@echo "  ✓ darwin-arm64 session helper (signed)"
 	@cp $(BIN_DIR)/darwin-arm64/wxt-agent-session $(EMBED_SLOT)
-	@CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o $(BIN_DIR)/darwin-arm64/wxt-agent ./cmd/agent
-	@echo "  ✓ darwin-arm64 (helper embedded)"
+	@CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CGO_CFLAGS="-arch arm64" CGO_LDFLAGS="-arch arm64" \
+		go build $(HELPER_LDFLAGS) -o $(BIN_DIR)/darwin-arm64/wxt-agent ./cmd/agent
+	$(call sign_macos_binary,$(BIN_DIR)/darwin-arm64/wxt-agent)
+	$(call check_embedded_helper,$(BIN_DIR)/darwin-arm64/wxt-agent-session)
+	@echo "  ✓ darwin-arm64 (signed, helper embedded, verified)"
 	@$(MAKE) --no-print-directory reset-embed-slot
+
+# Signing identity. Override with a Developer ID to produce distributable
+# builds:  make build-macos MACOS_SIGN_ID="Developer ID Application: Acme (TEAMID)"
+MACOS_SIGN_ID ?= -
+MACOS_BUNDLE_PREFIX ?= io.coredge.epm
+
+sign-macos: ## Code-sign the macOS binaries (ad-hoc by default)
+	@echo "Signing macOS binaries (identity: $(MACOS_SIGN_ID))..."
+	@# Why this step is not optional.
+	@#
+	@# On Apple Silicon the Go linker ad-hoc signs arm64 binaries by itself,
+	@# so those at least carry a cdhash. CROSS-COMPILED amd64 binaries get
+	@# nothing at all — "code object is not signed at all" — and an unsigned
+	@# binary has no code identity for macOS to key a TCC grant to. The
+	@# Accessibility and Screen Recording toggles then show as ON in System
+	@# Settings while AXIsProcessTrusted() keeps returning false, which is
+	@# indistinguishable from the product being broken.
+	@#
+	@# --identifier matters too: the linker's default is "a.out" for every
+	@# binary, so the agent and its helper claim the SAME identity. Each gets
+	@# its own here, because TCC lists them separately and the user has to be
+	@# able to tell which row is which.
+	@# The hardened runtime is applied ONLY with a real Developer ID.
+	@#
+	@# It is meaningless on an ad-hoc signature — there is nothing to harden
+	@# against without notarization — and it changes how macOS treats the
+	@# binary. TCC is the part that matters: Accessibility and Screen Recording
+	@# are granted against a code signature, and an unusual ad-hoc-plus-hardened
+	@# combination is not worth the risk of the grant quietly not applying to
+	@# the process that asks for it.
+	@opts=""; [ "$(MACOS_SIGN_ID)" = "-" ] || opts="--options runtime"; \
+	for arch in amd64 arm64; do \
+		for bin in wxt-agent wxt-agent-session; do \
+			f="$(BIN_DIR)/darwin-$$arch/$$bin"; \
+			[ -f "$$f" ] || continue; \
+			codesign --force --timestamp=none $$opts \
+				--identifier "$(MACOS_BUNDLE_PREFIX).$$bin" \
+				--sign "$(MACOS_SIGN_ID)" "$$f" >/dev/null 2>&1 \
+				&& echo "  ✓ darwin-$$arch/$$bin" \
+				|| echo "  ✗ darwin-$$arch/$$bin — codesign failed (macOS + Xcode CLT required)"; \
+		done; \
+	done
+	@echo "  Note: ad-hoc signatures give a stable identity but do NOT satisfy"
+	@echo "  Gatekeeper. Distribution still needs a Developer ID and notarization."
 
 build-windows: proto ## Build for Windows (amd64, arm64)
 	@echo "Building for Windows..."
@@ -244,6 +349,13 @@ deploy-binaries: packages-desktop ## Build macOS + Windows packages and copy to 
 	@f=$$(ls -t $(DIST_DIR)/dmg/wxt-agent-*-macos-arm64.dmg 2>/dev/null | head -1) && [ -n "$$f" ] && cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-arm64.dmg && echo "  ✓ wxt-agent-arm64.dmg" || echo "  ✗ wxt-agent-arm64.dmg not found (macOS only)"
 	@f=$$(ls -t $(DIST_DIR)/windows/wxt-agent_*_windows_amd64.exe 2>/dev/null | head -1) && [ -n "$$f" ] && cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-amd64.exe && echo "  ✓ wxt-agent-amd64.exe" || echo "  ✗ wxt-agent-amd64.exe not found"
 	@f=$$(ls -t $(DIST_DIR)/windows/wxt-agent_*_windows_arm64.exe 2>/dev/null | head -1) && [ -n "$$f" ] && cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-arm64.exe && echo "  ✓ wxt-agent-arm64.exe" || echo "  ✗ wxt-agent-arm64.exe not found"
+	@# The terminal-install artefacts: a tarball of the same .app bundle the
+	@# disk image ships, and the script that fetches it. Needed because macOS
+	@# quarantines anything a browser downloads and Gatekeeper then refuses to
+	@# open it; curl marks nothing, so this path never meets Gatekeeper.
+	@f=$$(ls -t $(DIST_DIR)/dmg/wxt-agent-macos-amd64.tar.gz 2>/dev/null | head -1) && [ -n "$$f" ] && cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/ && echo "  ✓ wxt-agent-macos-amd64.tar.gz" || echo "  ✗ wxt-agent-macos-amd64.tar.gz not found (macOS only)"
+	@f=$$(ls -t $(DIST_DIR)/dmg/wxt-agent-macos-arm64.tar.gz 2>/dev/null | head -1) && [ -n "$$f" ] && cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/ && echo "  ✓ wxt-agent-macos-arm64.tar.gz" || echo "  ✗ wxt-agent-macos-arm64.tar.gz not found (macOS only)"
+	@cp scripts/install-macos.sh $(AGENT_BACKEND_DIR)/agent-binaries/install-macos.sh && chmod +x $(AGENT_BACKEND_DIR)/agent-binaries/install-macos.sh && echo "  ✓ install-macos.sh"
 	@echo ""
 	@echo "(session helper is bundled inside each agent binary — no separate download)"
 	@echo "macOS standalone agent binaries (for curl installs)..."

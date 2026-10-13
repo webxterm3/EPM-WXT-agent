@@ -36,7 +36,10 @@ func Candidates(username, hostname, userDomain string) []string {
 		bare = username[i+1:]
 	}
 
-	ordered := []string{username}
+	var ordered []string
+	if !strings.HasSuffix(username, `\`) {
+		ordered = append(ordered, username)
+	}
 	// With nothing after the separator there is no name to qualify, and
 	// prefixing the empty string just buys three guaranteed-failed lookups.
 	if bare != "" {

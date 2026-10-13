@@ -8,11 +8,15 @@
 ; General Configuration
 ; --------------------------------
 
-!define PRODUCT_NAME "VSay Agent"
+!define PRODUCT_NAME "wxt-agent"
 !define PRODUCT_PUBLISHER "VSay"
 !define PRODUCT_WEB_SITE "https://vsay.in"
 !define PRODUCT_DIR_REGKEY "Software\Microsoft\Windows\CurrentVersion\App Paths\wxt-agent.exe"
-!define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
+; The key name is fixed rather than derived from PRODUCT_NAME, and it is the
+; SAME key the agent's own `configure` writes. Two spellings meant two entries
+; in Programs and Features for one product, on any machine where the installer
+; ran and the agent was then enrolled.
+!define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\EPMAgent"
 !define PRODUCT_UNINST_ROOT_KEY "HKLM"
 
 ; Version is passed during build
@@ -116,6 +120,24 @@ SectionEnd
 ; --------------------------------
 
 Section "Uninstall"
+  ; Stop the agent FIRST.
+  ;
+  ; This was missing, and its absence is not cosmetic: the agent runs from a
+  ; scheduled task registered as SYSTEM at boot. Deleting the files without
+  ; removing the task leaves Windows trying to launch a binary that is no
+  ; longer there, every single startup, forever — and leaves a running agent
+  ; holding the files being deleted.
+  DetailPrint "Stopping the agent service..."
+  nsExec::ExecToLog 'schtasks /end /tn "VsayAgent"'
+  Pop $0
+  nsExec::ExecToLog 'schtasks /delete /tn "VsayAgent" /f'
+  Pop $0
+  ; Belt and braces: a task that was ended may still have a live process.
+  nsExec::ExecToLog 'taskkill /f /im wxt-agent.exe'
+  Pop $0
+  nsExec::ExecToLog 'taskkill /f /im wxt-agent-session.exe'
+  Pop $0
+
   ; Remove from PATH
   EnVar::DeleteValue "PATH" "$INSTDIR"
 
@@ -137,10 +159,20 @@ Section "Uninstall"
   DeleteRegKey ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}"
   DeleteRegKey HKLM "${PRODUCT_DIR_REGKEY}"
 
-  ; Optionally remove config (ask user)
-  MessageBox MB_YESNO "Do you want to remove configuration files?" IDNO skip_config
-    RMDir /r "$APPDATA\VSay"
+  ; Optionally remove config.
+  ;
+  ; The path is C:\ProgramData\vsay, which is where configure actually writes
+  ; (agent.yaml, certs\, logs\). The old $APPDATA\VSay was simply the wrong
+  ; directory: answering "Yes" deleted nothing and left the enrolment
+  ; certificates on the machine.
+  MessageBox MB_YESNO "Also remove the agent's configuration, certificates and logs?$\r$\n$\r$\n(C:\ProgramData\vsay)$\r$\n$\r$\nKeep them if you are reinstalling and want this machine to stay enrolled." IDNO skip_config
+    RMDir /r "C:\ProgramData\vsay"
   skip_config:
+
+  ; The machine stays listed in the portal until an administrator removes it
+  ; there. Said out loud, because an uninstaller that goes quiet leaves people
+  ; assuming the whole thing is gone.
+  MessageBox MB_OK "wxt-agent has been removed from this computer.$\r$\n$\r$\nNo user account was changed — this agent never created one.$\r$\n$\r$\nThe machine stays listed in the EPM portal until an administrator deletes it there."
 
   SetAutoClose true
 SectionEnd

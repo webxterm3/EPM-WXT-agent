@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -166,4 +167,10 @@ func (a *Agent) persistConfig() error {
 // It is set from the command line rather than assumed, because the agent
 // accepts a --config flag and writing settings back to a guessed default
 // would leave the running agent and the file on disk disagreeing.
-func (a *Agent) SetConfigPath(path string) { a.configPath = path }
+func (a *Agent) SetConfigPath(path string) {
+	a.configPath = path
+
+	// The policy store lives beside the config file, so it can only be built
+	// once that path is known. Done here rather than in New for that reason.
+	a.policies = newPolicyStore(filepath.Dir(path), a.logger)
+}

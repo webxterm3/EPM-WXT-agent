@@ -6,7 +6,24 @@ package capture
 #cgo CFLAGS: -x objective-c -fobjc-arc -Wno-unused-parameter
 #cgo LDFLAGS: -framework Foundation -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -framework CoreGraphics
 #include <stdlib.h>
+#include <CoreGraphics/CoreGraphics.h>
 #include "capture_darwin.h"
+
+// wxt_screen_capture_permitted asks TCC whether Screen Recording is granted to
+// THIS process, without prompting and without starting a capture.
+static int wxt_screen_capture_permitted(void) {
+	return CGPreflightScreenCaptureAccess() ? 1 : 0;
+}
+
+// wxt_screen_capture_request asks for it WITH the prompt.
+//
+// Preflight answers the question and registers nothing; requesting is what
+// puts this binary into System Settings › Privacy & Security › Screen
+// Recording at all. Without it the list stays empty and somebody has to know
+// to press "+" and hunt down a binary in /usr/local/bin.
+static int wxt_screen_capture_request(void) {
+	return CGRequestScreenCaptureAccess() ? 1 : 0;
+}
 */
 import "C"
 
@@ -16,15 +33,14 @@ import (
 	"unsafe"
 
 	"github.com/Yesveer/wxt-agent/internal/remotecontrol/rfb"
+	"github.com/Yesveer/wxt-agent/internal/remotecontrol/tcc"
 )
 
 // ErrScreenRecordingDenied means macOS refused to hand over the screen. It is
 // its own error because the fix is a specific user action, and a generic
 // "capture failed" would send someone hunting through logs for a permission
 // dialog they simply never approved.
-var ErrScreenRecordingDenied = errors.New(
-	"macOS denied screen capture — grant Screen Recording to wxt-agent in " +
-		"System Settings › Privacy & Security › Screen Recording, then restart the agent")
+var ErrScreenRecordingDenied = errors.New(tcc.DeniedMessage("Screen Recording", "screen capture"))
 
 // ErrCaptureStopped means the stream ended underneath us: the user logged out,
 // the display was disconnected, or the Screen Recording grant was revoked
@@ -133,3 +149,10 @@ func cstr(b []byte) string {
 	}
 	return string(b)
 }
+
+// ScreenRecordingPermitted reports whether THIS process may see the screen.
+func ScreenRecordingPermitted() bool { return C.wxt_screen_capture_permitted() != 0 }
+
+// RequestScreenRecording asks for the right, which is what registers this
+// binary in System Settings if it is not listed yet.
+func RequestScreenRecording() bool { return C.wxt_screen_capture_request() != 0 }

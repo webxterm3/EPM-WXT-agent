@@ -1,25 +1,44 @@
 #!/bin/bash
-
-# Build DMG packages for macOS
+#
+# Build the macOS DMG.
+#
+# The disk image holds ONE application bundle, "wxt-agent.app", beside a link
+# to /Applications. Drag it across and open it: it enrols the machine if it is
+# not enrolled, and reports on it, checks its permissions or removes it if it
+# is.
+#
+# One rather than three, because an installer bundle, an uninstaller bundle and
+# a status bundle meant three things to drag, three names to explain and three
+# copies of what "installed" means. Nobody opens a terminal and nobody runs a
+# .command file either: macOS opens those in Terminal and asks somebody to
+# trust a shell script they cannot read.
 
 set -e
 
-# Colors
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-# Configuration
 PACKAGE_NAME="wxt-agent"
 VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo "1.0.0")}
-
-# Fix version if it doesn't start with a digit
 if [[ ! "$VERSION" =~ ^[0-9] ]]; then
     VERSION="0.0.0-${VERSION}"
 fi
 
 DIST_DIR="dist"
 BUILD_DIR="$DIST_DIR/dmg"
+TEMPLATE_DIR="scripts/macos-app"
+ICON_SCRIPT="scripts/icon/make-icon.py"
+BUNDLE_PREFIX="${MACOS_BUNDLE_PREFIX:-io.coredge.epm}"
+SIGN_ID="${MACOS_SIGN_ID:--}"
+
+# The paths the agent actually installs to. They are substituted into both app
+# bundles from here so the installer and the uninstaller cannot drift apart —
+# an uninstaller that deletes the wrong path is worse than none.
+INSTALL_DIR="/usr/local/bin"
+CONFIG_DIR="/etc/vsay"
+LOG_DIR="/var/log/vsay"
+DAEMON_LABEL="io.wxt.agent"
 
 echo -e "${GREEN}Building DMG packages${NC}"
 echo "Package: $PACKAGE_NAME"
@@ -28,7 +47,41 @@ echo ""
 
 mkdir -p "$BUILD_DIR"
 
-# Function to create DMG
+# write_info_plist <contents-dir> <display-name> <bundle-id> <executable>
+write_info_plist() {
+    cat > "$1/Info.plist" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>$2</string>
+    <key>CFBundleDisplayName</key><string>$2</string>
+    <key>CFBundleIdentifier</key><string>$3</string>
+    <key>CFBundleExecutable</key><string>$4</string>
+    <key>CFBundleVersion</key><string>${VERSION}</string>
+    <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>LSMinimumSystemVersion</key><string>12.0</string>
+    <!-- No Dock icon: both bundles put up a dialog, do their work and quit. A
+         bouncing icon for a three-second task is noise. -->
+    <key>LSUIElement</key><true/>
+    <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+}
+
+# render_template <source> <destination>
+render_template() {
+    sed -e "s|@@INSTALL_DIR@@|$INSTALL_DIR|g" \
+        -e "s|@@CONFIG_DIR@@|$CONFIG_DIR|g" \
+        -e "s|@@LOG_DIR@@|$LOG_DIR|g" \
+        -e "s|@@DAEMON_LABEL@@|$DAEMON_LABEL|g" \
+        "$1" > "$2"
+    chmod +x "$2"
+}
+
 create_dmg() {
     local ARCH=$1
     local BIN_SOURCE="$DIST_DIR/bin/darwin-${ARCH}/wxt-agent"
@@ -43,120 +96,124 @@ create_dmg() {
     fi
 
     local DMG_DIR="$BUILD_DIR/dmg-${ARCH}"
+    local STAGE="$DMG_DIR/stage"
     local DMG_NAME="${PACKAGE_NAME}-${VERSION}-macos-${ARCH}.dmg"
-    local VOL_NAME="Vsay Agent ${VERSION}"
+    local VOL_NAME="wxt-agent ${VERSION}"
 
     rm -rf "$DMG_DIR"
-    mkdir -p "$DMG_DIR/Vsay Agent"
+    mkdir -p "$STAGE"
 
-    # Copy binaries
-    cp "$BIN_SOURCE" "$DMG_DIR/Vsay Agent/wxt-agent"
-    chmod +x "$DMG_DIR/Vsay Agent/wxt-agent"
+    # ONE application. It was an installer bundle, an uninstaller bundle and a
+    # status bundle: three things to drag, three names to explain, and three
+    # copies of what "installed" means. This one looks at the machine and does
+    # whichever job applies.
+    local APP="$STAGE/wxt-agent.app"
+    mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+    write_info_plist "$APP/Contents" "wxt-agent" "${BUNDLE_PREFIX}.app" "wxt-agent-app"
+    render_template "$TEMPLATE_DIR/wxt-agent-app.sh" "$APP/Contents/MacOS/wxt-agent-app"
+
+    cp "$BIN_SOURCE" "$APP/Contents/Resources/wxt-agent"
+    chmod +x "$APP/Contents/Resources/wxt-agent"
     if [ -f "$HELPER_SOURCE" ]; then
-        cp "$HELPER_SOURCE" "$DMG_DIR/Vsay Agent/wxt-agent-session"
-        chmod +x "$DMG_DIR/Vsay Agent/wxt-agent-session"
+        cp "$HELPER_SOURCE" "$APP/Contents/Resources/wxt-agent-session"
+        chmod +x "$APP/Contents/Resources/wxt-agent-session"
+
+        # The helper ALSO lives inside Contents/MacOS, and that copy is the one
+        # that actually runs.
+        #
+        # macOS attributes a privacy request made by a binary inside an
+        # application bundle to the BUNDLE. Run from /usr/local/bin the helper
+        # is its own unbundled program, so System Settings lists it separately
+        # from the agent — two rows, two switches, for one product. Run from
+        # inside the bundle there is one row, named and iconed like the app,
+        # and granting it covers everything.
+        cp "$HELPER_SOURCE" "$APP/Contents/MacOS/wxt-agent-session"
+        chmod +x "$APP/Contents/MacOS/wxt-agent-session"
     else
         echo -e "${YELLOW}  Warning: session helper missing for darwin-$ARCH — remote control will not work${NC}"
     fi
 
-    # Create install script
-    cat > "$DMG_DIR/Vsay Agent/Install.command" << 'EOF'
-#!/bin/bash
-cd "$(dirname "$0")"
-echo "Installing wxt-agent..."
-sudo cp wxt-agent /usr/local/bin/
-sudo chmod +x /usr/local/bin/wxt-agent
+    # Shown in the Dock and Launchpad: this one is meant to be opened.
+    /usr/libexec/PlistBuddy -c "Delete :LSUIElement" "$APP/Contents/Info.plist" >/dev/null 2>&1 || true
 
-# The agent looks for the session helper NEXT TO ITSELF, so both have to land
-# in the same directory.
-if [ -f wxt-agent-session ]; then
-    sudo cp wxt-agent-session /usr/local/bin/
-    sudo chmod +x /usr/local/bin/wxt-agent-session
-    echo "✓ Session helper installed (needed for remote control)"
-fi
-
-echo ""
-echo "✓ Installation complete!"
-echo ""
-echo "To configure: wxt-agent configure --help"
-echo ""
-echo "For remote control, macOS will ask you to allow wxt-agent-session under"
-echo "System Settings > Privacy & Security > Screen Recording, and again under"
-echo "Accessibility. Both are required."
-echo ""
-read -p "Press Enter to close..."
-EOF
-    chmod +x "$DMG_DIR/Vsay Agent/Install.command"
-
-    # Create README
-    cat > "$DMG_DIR/Vsay Agent/README.txt" << EOF
-Vsay Agent ${VERSION}
-
-Installation:
-1. Double-click "Install.command" to install
-   OR
-   Open Terminal and run: sudo cp wxt-agent /usr/local/bin/
-
-Contents:
-  wxt-agent           the agent daemon
-  wxt-agent-session   the session helper, required for remote control.
-                      It MUST sit in the same directory as wxt-agent.
-
-Usage:
-  wxt-agent configure --help
-  wxt-agent start --config /etc/vsay/agent.yaml
-
-Remote control permissions (macOS only):
-  Grant wxt-agent-session both Screen Recording and Accessibility under
-  System Settings > Privacy & Security. Remote control cannot work without
-  them, and macOS will not grant them silently.
-
-For more information, visit: https://vsay.io
-EOF
-
-    # Check if we can create DMG (macOS only)
-    if command -v hdiutil >/dev/null 2>&1; then
-        echo "  Creating DMG for $ARCH..."
-        hdiutil create -volname "$VOL_NAME" \
-            -srcfolder "$DMG_DIR/Vsay Agent" \
-            -ov -format UDZO \
-            "$BUILD_DIR/$DMG_NAME"
-
-        # Create checksum
-        cd "$BUILD_DIR"
-        shasum -a 256 "$DMG_NAME" > "${DMG_NAME}.sha256"
-        cd - > /dev/null
-
-        echo -e "  ${GREEN}✓${NC} darwin-${ARCH}: $DMG_NAME"
+    # The icon. Generated from scripts/icon/make-icon.py rather than committed
+    # as a binary, so the shape and colours are reviewable. Without it macOS
+    # draws the blank-page placeholder, which makes a signed, working
+    # application look like something that failed to install.
+    if python3 "$ICON_SCRIPT" "$DMG_DIR" >/dev/null 2>&1 \
+        && iconutil -c icns "$DMG_DIR/wxt-agent.iconset" -o "$APP/Contents/Resources/wxt-agent.icns" >/dev/null 2>&1; then
+        /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string wxt-agent" "$APP/Contents/Info.plist" >/dev/null 2>&1
+        echo "  ✓ icon"
     else
-        # Fallback: Create ZIP instead
-        echo -e "${YELLOW}  hdiutil not available, creating ZIP instead...${NC}"
-        local ZIP_NAME="${PACKAGE_NAME}-${VERSION}-macos-${ARCH}.zip"
-
-        cd "$DMG_DIR"
-        zip -r "../$ZIP_NAME" "Vsay Agent"
-        cd - > /dev/null
-
-        mv "$DMG_DIR/../$ZIP_NAME" "$BUILD_DIR/"
-
-        # Create checksum
-        cd "$BUILD_DIR"
-        sha256sum "$ZIP_NAME" > "${ZIP_NAME}.sha256" 2>/dev/null || shasum -a 256 "$ZIP_NAME" > "${ZIP_NAME}.sha256"
-        cd - > /dev/null
-
-        echo -e "  ${GREEN}✓${NC} darwin-${ARCH}: $ZIP_NAME"
+        echo -e "${YELLOW}  Warning: could not build the icon (needs python3 with Pillow)${NC}"
     fi
 
-    # Cleanup
-    rm -rf "$DMG_DIR"
-}
+    # Signed for the same reason the binaries are: an unsigned bundle has no
+    # code identity, so macOS has nothing to key a grant to and Gatekeeper has
+    # nothing to check. Ad-hoc unless a Developer ID is supplied.
+    if codesign --force --deep --sign "$SIGN_ID" "$APP" >/dev/null 2>&1; then
+        echo "  ✓ signed wxt-agent.app"
+    else
+        echo -e "${YELLOW}  Warning: could not sign wxt-agent.app${NC}"
+    fi
 
-# Build for both architectures
-echo "Creating macOS packages..."
+    # The /Applications link is what makes this read as an ordinary Mac
+    # install: drag across, done.
+    ln -s /Applications "$STAGE/Applications"
+
+    cat > "$STAGE/README.txt" << README
+wxt-agent ${VERSION} (macOS ${ARCH})
+
+INSTALL
+  1. Drag wxt-agent onto the Applications folder.
+  2. Open it.
+  3. Paste the enrolment command from the EPM portal, then authenticate.
+
+AFTERWARDS
+  Opening wxt-agent again shows its status, checks its permissions, or removes it.
+
+PERMISSIONS
+Remote control needs two macOS permissions. Once the agent has run, both
+wxt-agent entries are LISTED for you in:
+
+    System Settings > Privacy & Security > Accessibility
+    System Settings > Privacy & Security > Screen Recording
+
+Switch each one on. You do not need to add any files by hand.
+
+If you are upgrading and an entry is already switched on, remove it with the
+minus button and add it again. macOS ties the grant to the exact build it was
+given, so an entry left over from an older build stays on while granting
+nothing.
+
+ACCOUNTS
+This agent does not create user accounts. It works with the accounts already on
+the machine.
+README
+
+    # A tarball of the SAME bundle, for the terminal install.
+    #
+    # Built from the identical staged .app rather than assembled separately,
+    # so the two ways of installing cannot drift into shipping different
+    # software. It exists because macOS marks anything a BROWSER downloads
+    # with com.apple.quarantine and Gatekeeper then refuses to open it; curl
+    # sets no such mark, so a terminal install never meets Gatekeeper.
+    tar -czf "$BUILD_DIR/wxt-agent-macos-${ARCH}.tar.gz" -C "$STAGE" "wxt-agent.app"
+    shasum -a 256 "$BUILD_DIR/wxt-agent-macos-${ARCH}.tar.gz" \
+        > "$BUILD_DIR/wxt-agent-macos-${ARCH}.tar.gz.sha256"
+    echo -e "${GREEN}  ✓ wxt-agent-macos-${ARCH}.tar.gz${NC}"
+
+    hdiutil create -volname "$VOL_NAME" -srcfolder "$STAGE" -ov -format UDZO \
+        "$BUILD_DIR/$DMG_NAME" >/dev/null
+    shasum -a 256 "$BUILD_DIR/$DMG_NAME" > "$BUILD_DIR/$DMG_NAME.sha256"
+    rm -rf "$DMG_DIR"
+
+    echo -e "${GREEN}  ✓ $DMG_NAME${NC}"
+}
 
 create_dmg "amd64"
 create_dmg "arm64"
 
 echo ""
-echo -e "${GREEN}✓ macOS packages built:${NC}"
-ls -la "$BUILD_DIR"/*.dmg "$BUILD_DIR"/*.zip 2>/dev/null || echo "  (none)"
+echo -e "${GREEN}DMG packages built${NC}"
+ls -la "$BUILD_DIR"/*.dmg 2>/dev/null || true

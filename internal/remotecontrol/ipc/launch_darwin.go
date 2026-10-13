@@ -87,5 +87,17 @@ func consoleUID() (int, error) {
 func helperLogPath() string {
 	dir := "/var/log/vsay"
 	_ = os.MkdirAll(dir, 0o755) // #nosec G301 -- matches the agent's own log dir
-	return filepath.Join(dir, "session-helper.log")
+	path := filepath.Join(dir, "session-helper.log")
+
+	// Created here, world-readable, rather than left to the helper.
+	//
+	// The helper runs in the user's session; this directory is root-owned, so
+	// whatever the helper creates there ends up unreadable to the person who
+	// needs it — "cat: Permission denied" on the one file that explains why
+	// remote control will not start.
+	if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil { // #nosec G302,G304
+		_ = f.Close()
+		_ = os.Chmod(path, 0o644) // #nosec G302 -- a log somebody has to be able to read
+	}
+	return path
 }

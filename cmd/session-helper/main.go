@@ -42,12 +42,19 @@ func main() {
 		token   = flag.String("token", "", "one-time authentication token (required)")
 		logPath = flag.String("log", "", "write logs to this file instead of stderr")
 		showVer = flag.Bool("version", false, "print the version and exit")
+		// Answers, from inside this process, whether the grants it needs
+		// actually apply. Nothing else can: a switched-on row in System
+		// Settings proves a row exists, not that it matches the binary asking.
+		checkPerms = flag.Bool("check-permissions", false, "report whether this binary holds the macOS grants it needs, and exit")
 	)
 	flag.Parse()
 
 	if *showVer {
 		fmt.Printf("wxt-agent-session %s\n", version)
 		return
+	}
+	if *checkPerms {
+		os.Exit(reportPermissions())
 	}
 	if *connect == "" || *token == "" {
 		fmt.Fprintln(os.Stderr,
@@ -74,6 +81,11 @@ func main() {
 		zap.String("agent", *connect),
 		zap.Int("pid", os.Getpid()),
 		zap.String("privilege", describeElevation()))
+
+	// Ask macOS for the two grants remote control needs. This is what makes
+	// wxt-agent-session appear in System Settings at all; see
+	// requestOSPermissions.
+	requestOSPermissions(logger)
 
 	svc := session.New(logger)
 	svc.SetEmitter(func(e ipc.Event) {

@@ -13,12 +13,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Yesveer/wxt-agent/internal/remotecontrol/helperbin"
@@ -46,6 +48,10 @@ const helperStartTimeout = 35 * time.Second
 type Controller struct {
 	logger     *zap.Logger
 	helperPath string
+
+	// permWatch is set while a permission watch is running, so a burst of
+	// refused sessions starts one watcher rather than one per attempt.
+	permWatch atomic.Bool
 
 	// send delivers a message back to the backend on the given session.
 	send func(sessionID string, data []byte) error
@@ -99,6 +105,22 @@ func helperNames() []string {
 // the running agent. Deriving it avoids a config option that could drift out of
 // step with the install layout.
 func defaultHelperDir() string {
+	// The application bundle first, on macOS, and the reason is not tidiness.
+	//
+	// macOS attributes a privacy request made by a binary inside a bundle to
+	// the BUNDLE. A helper run from /usr/local/bin is its own unbundled
+	// program, so System Settings lists it separately from the agent: two
+	// rows and two switches for one product, and granting one of them does
+	// nothing for the other. Run from inside wxt-agent.app there is a single
+	// row, named and iconed like the app.
+	//
+	// Falls through to the agent's own directory when the bundle is not
+	// installed — an agent enrolled from the command line still works, it just
+	// shows the second row.
+	if dir := bundleHelperDir(); dir != "" {
+		return dir
+	}
+
 	exe, err := os.Executable()
 	if err != nil {
 		return "."
@@ -232,6 +254,16 @@ func (c *Controller) handleStart(sessionID string, msg map[string]any) {
 		if resp != nil && resp.State != "" {
 			state = resp.State
 		}
+
+		// A refusal can also surface here, when the helper fails before it
+		// gets as far as asking for consent. The usual path is the event
+		// handler below — see onHelperEvent.
+		if isPermissionDenied(err) {
+			c.logger.Info("Session refused for want of a macOS permission; watching for it to be granted")
+			c.dropHelper()
+			c.watchForPermissions()
+		}
+
 		c.reply(sessionID, ipc.Response{State: state, Error: err.Error()})
 		return
 	}
@@ -332,10 +364,76 @@ func (c *Controller) ensureHelper(sessionID string) (*ipc.Host, error) {
 	return host, nil
 }
 
+// sessionInFlight reports whether a helper is currently connected.
+//
+// Used by the permission watch to keep out of the way: its check launches a
+// helper of its own, and doing that while a session is being set up is a race
+// for no benefit.
+func (c *Controller) sessionInFlight() bool {
+	c.mu.Lock()
+	host := c.host
+	c.mu.Unlock()
+	return host != nil && host.Connected()
+}
+
+// dropHelper closes the current helper so the next session starts a new one.
+func (c *Controller) dropHelper() {
+	c.mu.Lock()
+	host := c.host
+	c.host = nil
+	c.mu.Unlock()
+
+	if host != nil {
+		_ = host.Close()
+	}
+}
+
+// isPermissionDenied reports whether an error is macOS refusing a TCC grant.
+//
+// Matched on text because the error crosses a process boundary as a string:
+// the helper is a separate program, so the sentinel errors cannot survive the
+// trip. Markers rather than whole messages, since those carry a binary path
+// that differs per machine.
+func isPermissionDenied(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"denied screen capture", "denied input control", "declined tccs",
+		"screen recording", "accessibility",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // onHelperEvent forwards a helper event to the backend.
 func (c *Controller) onHelperEvent(e ipc.Event) {
 	if e.Kind == "keepalive" {
 		return
+	}
+
+	// A permission refusal arrives HERE, not as an error from OpStart.
+	//
+	// The helper answers the start request with "awaiting consent" and only
+	// discovers it has no Screen Recording or Accessibility grant afterwards,
+	// once consent is given and it tries to capture — by which time the call
+	// has long returned successfully. So the check in handleStart, which looks
+	// at that call's error, never saw a refusal: the helper was never dropped,
+	// the watch never started, and the agent never restarted itself. The log
+	// showed session after session failing with nothing reacting to it.
+	if e.State == ipc.StateError && isPermissionDenied(errors.New(e.Message)) {
+		c.logger.Info("Session refused for want of a macOS permission; watching for it to be granted")
+		// Reported to the backend first — dropping the helper closes the
+		// connection this event arrived on, and the portal still needs to be
+		// told why the session failed.
+		defer func() {
+			c.dropHelper()
+			c.watchForPermissions()
+		}()
 	}
 
 	c.mu.Lock()

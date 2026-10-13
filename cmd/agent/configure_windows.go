@@ -189,6 +189,12 @@ func runConfigureWindows(p configureParams) error {
 		return fmt.Errorf("failed to register startup task: %w", err)
 	}
 	fmt.Println("✓ Agent registered to run at system startup and started")
+
+	// 9. Make the product visible where an administrator looks for installed
+	// software. Without this the enrolment leaves a service running that
+	// appears in no list and that nobody can remove through Control Panel.
+	registerInAddRemovePrograms(winInstalledExe, winConfigDir, version)
+	fmt.Println("✓ Listed in Control Panel → Programs and Features as \"wxt-agent\"")
 	fmt.Println("")
 	fmt.Println("Check task:  schtasks /query /tn", winTaskName)
 	fmt.Println("Stop agent:  schtasks /end /tn", winTaskName)

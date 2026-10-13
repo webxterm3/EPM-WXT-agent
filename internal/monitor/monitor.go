@@ -131,15 +131,20 @@ func (m *Monitor) GetAgentStats() AgentStats {
 func (m *Monitor) getCPUPercent() (float32, error) {
 	// Get CPU percent over 1 second interval
 	percentages, err := cpu.Percent(time.Second, false)
+	if err == nil && len(percentages) > 0 {
+		return float32(percentages[0]), nil
+	}
+
+	// gopsutil cannot read CPU times on macOS without cgo, and this agent
+	// ships static. Rather than report 0% forever, ask the platform directly.
+	if fallback, ferr := cpuPercentFallback(); ferr == nil {
+		return fallback, nil
+	}
+
 	if err != nil {
 		return 0, err
 	}
-
-	if len(percentages) == 0 {
-		return 0, fmt.Errorf("no CPU data available")
-	}
-
-	return float32(percentages[0]), nil
+	return 0, fmt.Errorf("no CPU data available")
 }
 
 // getMemoryPercent returns memory usage percentage

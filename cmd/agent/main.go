@@ -113,6 +113,20 @@ func main() {
 	showConfigCmd.Flags().String("config", "/etc/vsay/agent.yaml", "Config file path")
 	rootCmd.AddCommand(showConfigCmd)
 
+	// Uninstall. Also what Windows Control Panel runs, and what the macOS
+	// uninstaller bundle calls, so there is one description of what
+	// "installed" means rather than three that drift.
+	rootCmd.AddCommand(newUninstallCommand())
+
+	// Permission diagnostics: the only way to tell "the grant is missing" from
+	// "the grant exists but does not apply to this build", which look
+	// identical from System Settings.
+	rootCmd.AddCommand(newCheckPermissionsCommand())
+
+	// Used by the macOS application to ask for the enrolment command in a real
+	// text area; AppleScript's dialog only offers a single line.
+	rootCmd.AddCommand(newPromptCommand())
+
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)
 	}
@@ -568,112 +582,43 @@ func normalizeGRPCAddr(addr string) string {
 	return strings.TrimSuffix(addr, ":")
 }
 
-// ensureLinuxUser creates the Linux user if it doesn't exist, sets up home directory,
-// and optionally adds to sudo group. Returns the home directory path.
+// ensureLinuxUser resolves the account's home directory. It does NOT create
+// the account.
 //
-// username/allowSudo come from the `configure` command's CLI flags, set by
-// whoever is running this installer locally — already a root-equivalent
-// operation, not remote/attacker-reachable input. Every exec.Command below
-// passes them as separate argv elements (no shell), so they can't be used
-// for command injection either way.
+// It used to run useradd, and adding a login to every endpoint it touched is
+// not this product's job: the accounts on a managed machine belong to the
+// company's directory, MDM or IT team. EPM enables and disables access for
+// accounts that already exist. Creating one silently also left a login behind
+// on every machine the agent was ever installed on, which no uninstaller
+// removed and no screen in the portal ever showed.
 func ensureLinuxUser(username string, allowSudo bool) (string, error) {
 	homeDir := "/home/" + username
 
-	// Check if user already exists
-	cmd := exec.Command("id", username) // #nosec G204
-	if err := cmd.Run(); err != nil {
-		// User doesn't exist, create it
-		fmt.Printf("Creating Linux user '%s'...\n", username)
-
-		// Create user with home directory and bash shell
-		// useradd -m -d /home/<user> -s /bin/bash <username>
-		createCmd := exec.Command("useradd", "-m", "-d", homeDir, "-s", "/bin/bash", username) // #nosec G204
-		output, err := createCmd.CombinedOutput()
-		if err != nil {
-			return "", fmt.Errorf("failed to create user '%s': %w\nOutput: %s", username, err, string(output))
-		}
-		fmt.Printf("✓ User '%s' created with home directory: %s\n", username, homeDir)
-	} else {
-		// User exists, get their home directory. Parsed in Go rather than piped
-		// through `bash -c "... | cut ..."` so username never touches a shell —
-		// a username containing shell metacharacters could otherwise inject
-		// arbitrary commands into that string.
-		homeCmd := exec.Command("getent", "passwd", username) // #nosec G204
-		output, err := homeCmd.Output()
-		if err == nil && len(output) > 0 {
-			fields := strings.Split(strings.TrimSpace(string(output)), ":")
-			if len(fields) >= 6 {
-				homeDir = fields[5]
-			}
-		}
-		fmt.Printf("✓ User '%s' already exists (home: %s)\n", username, homeDir)
+	if err := exec.Command("id", username).Run(); err != nil { // #nosec G204
+		return "", fmt.Errorf(
+			"the account %q does not exist on this machine.\n"+
+				"This agent does not create accounts — create it first (for example:\n"+
+				"  sudo useradd -m -s /bin/bash %s\n"+
+				"), then run configure again, or pass --user with an account that exists",
+			username, username)
 	}
 
-	// Handle sudo access
+	// Parsed in Go rather than piped through a shell: a username containing
+	// shell metacharacters could otherwise inject arbitrary commands.
+	if output, err := exec.Command("getent", "passwd", username).Output(); err == nil && len(output) > 0 { // #nosec G204
+		fields := strings.Split(strings.TrimSpace(string(output)), ":")
+		if len(fields) >= 6 && fields[5] != "" {
+			homeDir = fields[5]
+		}
+	}
+	fmt.Printf("✓ Using existing account '%s' (home: %s)\n", username, homeDir)
+
 	if allowSudo {
-		// Add user to sudo group
-		fmt.Printf("Adding '%s' to sudo group...\n", username)
-
-		// Try 'sudo' group first (Debian/Ubuntu), then 'wheel' (RHEL/CentOS)
-		sudoGroups := []string{"sudo", "wheel"}
-		added := false
-
-		for _, group := range sudoGroups {
-			// Check if group exists
-			checkCmd := exec.Command("getent", "group", group) // #nosec G204
-			if checkCmd.Run() != nil {
-				continue
-			}
-
-			// Add user to group
-			addCmd := exec.Command("usermod", "-aG", group, username) // #nosec G204
-			if err := addCmd.Run(); err == nil {
-				fmt.Printf("✓ User '%s' added to '%s' group\n", username, group)
-				added = true
-				break
-			}
-		}
-
-		if !added {
-			return homeDir, fmt.Errorf("failed to add user to sudo group. Neither 'sudo' nor 'wheel' group found")
-		}
-
-		// Configure passwordless sudo for this user
-		sudoersFile := fmt.Sprintf("/etc/sudoers.d/vsay-%s", username)
-		sudoersContent := fmt.Sprintf("%s ALL=(ALL) NOPASSWD: ALL\n", username)
-
-		// 0440 is REQUIRED here, not a choice — visudo itself rejects any
-		// sudoers.d file with different permissions, so this must never be
-		// "tightened" to 0600 or it breaks sudo for this user entirely.
-		if err := os.WriteFile(sudoersFile, []byte(sudoersContent), 0440); err != nil { // #nosec G306
-			return homeDir, fmt.Errorf("failed to create sudoers file: %w", err)
-		}
-
-		// Validate sudoers file
-		validateCmd := exec.Command("visudo", "-c", "-f", sudoersFile) // #nosec G204
-		if output, err := validateCmd.CombinedOutput(); err != nil {
-			// Invalid sudoers file, remove it
-			if rerr := os.Remove(sudoersFile); rerr != nil {
-				fmt.Printf("Warning: failed to remove invalid sudoers file: %v\n", rerr)
-			}
-			return homeDir, fmt.Errorf("invalid sudoers file: %s", string(output))
-		}
-
-		fmt.Printf("✓ Passwordless sudo configured for '%s'\n", username)
-	} else {
-		// Remove passwordless sudo if it was previously configured
-		sudoersFile := fmt.Sprintf("/etc/sudoers.d/vsay-%s", username)
-		if err := os.Remove(sudoersFile); err != nil && !os.IsNotExist(err) {
-			fmt.Printf("Warning: failed to remove sudoers file: %v\n", err)
-		}
-
-		fmt.Printf("✓ User '%s' configured as normal user (no sudo access)\n", username)
-	}
-
-	// Ensure home directory has correct ownership
-	chownCmd := exec.Command("chown", "-R", username+":"+username, homeDir) // #nosec G204
-	if err := chownCmd.Run(); err != nil {
-		fmt.Printf("Warning: chown %s failed (may already be correct): %v\n", homeDir, err)
+		// Group membership is also left alone, for the same reason: granting
+		// an account sudo is a privilege change the machine's owner makes, not
+		// something an installer slips in.
+		fmt.Printf("Note: --allow-sudo no longer modifies groups or /etc/sudoers.d.\n")
+		fmt.Printf("      Grant '%s' sudo yourself if that is what you intend.\n", username)
 	}
 
 	return homeDir, nil

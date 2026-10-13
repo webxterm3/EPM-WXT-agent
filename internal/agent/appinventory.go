@@ -12,19 +12,51 @@ import (
 )
 
 // appInventoryInterval is how often the machine's installed software is
-// re-scanned.
+// re-scanned on its own.
 //
 // Software is installed and removed on the order of days, so a frequent scan
-// buys nothing and costs a filesystem and registry walk on somebody's laptop.
-// A scan also runs immediately on connect, so a change is picked up at the
-// next reconnect rather than waiting out the full interval.
-const appInventoryInterval = 12 * time.Hour
+// buys nothing and costs a filesystem and registry walk on somebody's laptop —
+// a macOS bundle scan takes several seconds of real I/O. Once a day is the
+// right cadence for a list that changes weekly; anything an operator needs
+// sooner than that, they ask for with "Scan now" in the portal.
+const appInventoryInterval = 24 * time.Hour
+
+// appInventoryMinGap is the shortest time between two scans the agent starts
+// by itself.
+//
+// The loop lives for the lifetime of ONE connection and scans as soon as it
+// starts, so without this a machine on a flaky network re-scans every time it
+// reconnects — which on a bad afternoon is far more often than the interval
+// above, quietly undoing it. A manual scan from the portal is deliberately not
+// subject to this: somebody asked.
+const appInventoryMinGap = time.Hour
 
 // appInventoryScanTimeout bounds one scan.
 //
 // A machine with a very large number of installed packages, or a stalled
 // filesystem, must not leave a scan running forever holding its collector.
 const appInventoryScanTimeout = 10 * time.Minute
+
+// InventoryScanCommandID asks the agent to scan its installed software now,
+// instead of waiting out appInventoryInterval.
+//
+// It must match the constant the backend sends; the drift test in the
+// backend's store package reads this file to check that it still does.
+const InventoryScanCommandID = "__vsay_inventory_scan__"
+
+// requestInventoryScan asks the inventory loop to run a scan now.
+//
+// The send is non-blocking onto a buffered channel of one, which coalesces on
+// purpose: an operator clicking "Scan now" five times, or five operators
+// clicking once, must cost one scan and not five filesystem walks queued up
+// behind each other on somebody's laptop.
+func (a *Agent) requestInventoryScan() {
+	select {
+	case a.inventoryScanNow <- struct{}{}:
+	default:
+		a.logger.Info("App inventory: a scan is already pending, ignoring the request")
+	}
+}
 
 // appInventoryLoop reports the machine's installed applications.
 //
@@ -51,19 +83,47 @@ func (a *Agent) appInventoryLoop(ctx context.Context) {
 	ticker := time.NewTicker(appInventoryInterval)
 	defer ticker.Stop()
 
-	a.reportAppInventory(ctx, collector)
+	// The scan-on-connect, skipped when one has just run. The timestamp lives
+	// on the agent rather than in this function because the function is
+	// restarted on every reconnect, which is exactly the case it guards.
+	if since := time.Since(a.lastInventoryScan()); since < appInventoryMinGap {
+		a.logger.Info("App inventory: skipping the scan on connect, one ran recently",
+			zap.Duration("ago", since.Round(time.Second)))
+	} else {
+		a.reportAppInventory(ctx, collector)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			a.reportAppInventory(ctx, collector)
+		case <-a.inventoryScanNow:
+			// Deliberately shares the loop rather than scanning in its own
+			// goroutine: one collector, one scan at a time. Two concurrent
+			// walks would race to report, and the later-finishing one would
+			// decide what counts as removed.
+			a.logger.Info("App inventory: scan requested from the portal")
+			a.reportAppInventory(ctx, collector)
 		}
 	}
 }
 
+// lastInventoryScan reports when a scan last finished. Zero before the first.
+func (a *Agent) lastInventoryScan() time.Time {
+	a.inventoryMu.Lock()
+	defer a.inventoryMu.Unlock()
+	return a.inventoryLastScan
+}
+
 // reportAppInventory runs one scan and sends it.
 func (a *Agent) reportAppInventory(ctx context.Context, collector appinventory.Collector) {
+	defer func() {
+		a.inventoryMu.Lock()
+		a.inventoryLastScan = time.Now()
+		a.inventoryMu.Unlock()
+	}()
+
 	scanCtx, cancel := context.WithTimeout(ctx, appInventoryScanTimeout)
 	defer cancel()
 
