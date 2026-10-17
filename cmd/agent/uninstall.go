@@ -23,6 +23,7 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 	for _, line := range uninstallPlan(keepConfig) {
 		fmt.Println("  •", line)
 	}
+	fmt.Println("  • Any application this agent blocked is restored first.")
 	fmt.Println()
 	fmt.Println("No user account is changed — this agent never created one.")
 	fmt.Println("The machine stays listed in the portal until an administrator removes it there.")
@@ -36,6 +37,11 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 	}
+
+	// Before anything of ours is removed: the user's own software goes back
+	// first. An agent deleted while holding launch locks leaves applications
+	// that will not start and nothing left that knows how to fix them.
+	releaseAppControlLocks()
 
 	// Every step reports its own outcome and none of them stops the rest. An
 	// uninstaller has to finish on a half-installed machine — which is exactly

@@ -1,0 +1,11 @@
+WXT-TRAY-PLACEHOLDER
+This file is a build-time placeholder, not a binary.
+
+The same arrangement as helper.bin, for the status-area program: the Makefile
+overwrites it with the real menu bar / tray binary for the target platform
+immediately before building the agent, which is what lets the agent install it
+from a single downloaded file.
+
+An agent built without that step embeds THIS text. traybin.Available() detects
+it by the marker on the first line, so configure falls back to looking for a
+copy on disk rather than writing garbage and failing unreadably.

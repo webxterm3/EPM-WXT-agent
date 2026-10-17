@@ -15,6 +15,7 @@ import (
 	"github.com/Yesveer/wxt-agent/internal/agent"
 	"github.com/Yesveer/wxt-agent/internal/config"
 	"github.com/Yesveer/wxt-agent/internal/remotecontrol"
+	"github.com/Yesveer/wxt-agent/internal/traybin"
 )
 
 // macOS install paths. The agent keeps its config and certs where the Linux
@@ -30,6 +31,10 @@ const (
 	macConfigPath        = "/etc/vsay/agent.yaml"
 	macLogPath           = "/var/log/vsay/agent.log"
 	macInstallDir        = "/usr/local/bin"
+	// The menu bar item: a per-user LaunchAgent, installed machine-wide so it
+	// starts for whoever logs in rather than only for whoever installed it.
+	macMenuBarBinary = "/usr/local/bin/wxt-agent-menubar"
+	macLaunchAgent   = "/Library/LaunchAgents/" + agent.LaunchAgentLabel + ".plist"
 )
 
 // runConfigureDarwin configures the agent on macOS.
@@ -140,12 +145,23 @@ func runConfigureDarwin(p configureParams) error {
 		return fmt.Errorf("failed to install the launchd service: %w", err)
 	}
 	fmt.Println("✓ Agent daemon installed and started")
+
+	if err := setupMenuBarAgent(); err != nil {
+		// Cosmetic. The agent works perfectly without a menu bar icon, and an
+		// enrolment that otherwise succeeded must not be reported as failed
+		// because an icon could not be installed.
+		fmt.Printf("Warning: could not install the menu bar item: %v\n", err)
+	} else {
+		fmt.Println("✓ Menu bar item installed")
+	}
 	fmt.Println("✓ Agent will start automatically on boot")
 
 	fmt.Println("")
-	fmt.Println("One more step — macOS will not grant these silently:")
-	fmt.Println("  System Settings › Privacy & Security › Screen Recording  → allow wxt-agent-session")
-	fmt.Println("  System Settings › Privacy & Security › Accessibility     → allow wxt-agent-session")
+	fmt.Println("One more step — macOS will not grant these silently.")
+	fmt.Println("Asking for them now so they appear in System Settings…")
+	waitForSettingsPane()
+	registerPermissionRows()
+	fmt.Println("")
 	fmt.Println("Remote control cannot capture the screen or move the mouse without both.")
 	fmt.Println("")
 	fmt.Printf("Check status: sudo launchctl print system/%s\n", macLaunchDaemonLabel)
@@ -227,6 +243,22 @@ func installSessionHelper() error {
 
 	dst := filepath.Join(macInstallDir, remotecontrol.CanonicalHelperName())
 
+	// With the application bundle present, the bundle's copy is the only one
+	// that should exist.
+	//
+	// Both installers already delete the loose copy, with a comment explaining
+	// why — and this function then put it straight back, six lines later in
+	// the same script. A second copy of the helper at a second path is a
+	// second privacy client: macOS lists it separately, under a blank icon,
+	// and no amount of signing makes the two rows merge. It is also never
+	// executed once the bundle is there, so it could only ever collect a grant
+	// that does nothing.
+	if remotecontrol.BundleHelperPath() != "" {
+		removeLooseCopy(dst)
+		fmt.Println("✓ Session helper: using the copy inside wxt-agent.app")
+		return nil
+	}
+
 	// The agent carries the helper inside itself, so a normal install needs no
 	// second download. A copy sitting next to the binary still wins, which is
 	// what lets a developer test a helper they just built.
@@ -263,6 +295,21 @@ func setupLaunchDaemon() error {
 		fmt.Printf("✓ Agent installed to %s\n", installedPath)
 	}
 
+	// launchd starts the BUNDLE's copy when there is one.
+	//
+	// This is what collapses the product to a single row in System Settings.
+	// macOS attributes a privacy request to the responsible process — the
+	// topmost launchd-started ancestor — and launchctl asuser does not reset
+	// it, so whichever binary launchd started is what every session helper's
+	// request is recorded against. Started from /usr/local/bin that is an
+	// unbundled binary with a blank icon; started from inside wxt-agent.app it
+	// is the application itself, which is the row people are told to switch
+	// on. The /usr/local/bin copy stays for command-line use.
+	runPath := runtimeAgentPath()
+	if runPath != installedPath {
+		fmt.Printf("✓ Daemon will run from %s\n", runPath)
+	}
+
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -286,7 +333,7 @@ func setupLaunchDaemon() error {
 	<string>%s</string>
 </dict>
 </plist>
-`, macLaunchDaemonLabel, installedPath, macConfigPath, macLogPath, macLogPath)
+`, macLaunchDaemonLabel, runPath, macConfigPath, macLogPath, macLogPath)
 
 	// LaunchDaemon plists must be owned by root and not group/world writable,
 	// or launchd refuses to load them.
@@ -323,3 +370,77 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	_ = os.Remove(dst)
 	return os.WriteFile(dst, data, mode)
 }
+
+// setupMenuBarAgent installs the menu bar item as a per-user LaunchAgent.
+//
+// /Library/LaunchAgents rather than ~/Library: the agent is installed once,
+// machine-wide, and the icon should appear for whoever logs in — not only for
+// the account that happened to run the installer.
+//
+// launchd starts a LaunchAgent in each GUI session automatically, so nothing
+// here has to find the logged-in user or bootstrap anything into their
+// session.
+func setupMenuBarAgent() error {
+	// From inside this binary first, for the same reason the session helper is
+	// embedded: the agent is installed by copying one file, and anything that
+	// has to travel separately eventually does not. A copy beside the agent is
+	// still accepted, for a build made without the embed step.
+	src := filepath.Join(filepath.Dir(installedAgentPath()), "wxt-agent-menubar")
+	if _, err := traybin.Extract(src); err != nil {
+		if _, statErr := os.Stat(src); statErr != nil {
+			return fmt.Errorf("this build carries no menu bar program and none is installed")
+		}
+	}
+
+	// Run the bundle's copy where there is one, and delete the loose one.
+	//
+	// Same reason as the daemon: a binary launched from /usr/local/bin is its
+	// own privacy client. The menu bar item asks macOS for nothing at all, but
+	// it used to run the permission check — which spawns the helper, which
+	// does ask — and the row that created was in the MENU BAR's name. Keeping
+	// one copy, inside the bundle, removes the possibility entirely.
+	if bundled := runtimeMenuBarPath(); bundled != src {
+		removeLooseCopy(src)
+		src = bundled
+	}
+
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>%s</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>%s</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<!-- Aqua only. Without this launchd would also start it in non-GUI
+	     contexts, where there is no menu bar to draw in and the process would
+	     sit there achieving nothing. -->
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+</dict>
+</plist>
+`, agent.LaunchAgentLabel, src)
+
+	if err := os.WriteFile(macLaunchAgent, []byte(plist), 0644); err != nil { // #nosec G306 -- launchd requires a world-readable plist
+		return fmt.Errorf("could not write %s: %w", macLaunchAgent, err)
+	}
+
+	// Started in the console user's session now, so the icon appears without
+	// waiting for a log-out. A failure here is not fatal: launchd loads it at
+	// the next login regardless.
+	if uid, err := consoleUserID(); err == nil {
+		target := fmt.Sprintf("gui/%d", uid)
+		_ = exec.Command("/bin/launchctl", "bootout", target+"/"+agent.LaunchAgentLabel).Run()
+		_ = exec.Command("/bin/launchctl", "bootstrap", target, macLaunchAgent).Run()
+	}
+	return nil
+}
+
+// installedAgentPath is where the agent binary lives once installed.
+func installedAgentPath() string { return filepath.Join(macInstallDir, "wxt-agent") }

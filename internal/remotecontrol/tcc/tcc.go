@@ -15,6 +15,14 @@ import (
 	"path/filepath"
 )
 
+// ProductRowName is what System Settings calls this product.
+//
+// It comes from CFBundleName in the Info.plist embedded in this binary, which
+// declares the application's bundle identifier — so macOS shows the product's
+// name and icon rather than the helper's file name and a blank glyph. The two
+// have to agree or this message points at a row that does not exist.
+const ProductRowName = "wxt-agent"
+
 // selfPath is the running executable's resolved path.
 func selfPath() string {
 	exe, err := os.Executable()
@@ -34,43 +42,32 @@ func selfPath() string {
 func DeniedMessage(right, what string) string {
 	msg := fmt.Sprintf("macOS denied %s.", what)
 
+	// ONE row, under the product's own name.
+	//
+	// This binary is signed with the application's bundle identifier, so macOS
+	// sees the whole product as a single code identity and lists it once, with
+	// the product icon — rather than once per binary per path, under bare file
+	// names with a blank icon. Naming anything else here sends somebody to a
+	// row that grants nothing.
+	msg += fmt.Sprintf(
+		" Switch on %s — the row with the product icon — in"+
+			" System Settings › Privacy & Security › %s.", ProductRowName, right)
+
+	msg += " That one row covers the whole product; there is nothing else to add."
+
+	// People arriving at this message have usually already added two or three
+	// binaries by hand looking for the one that worked. Those rows are inert
+	// and they make the list unreadable, so say to remove them.
+	msg += " Any rows with a blank icon (wxt-agent-session, wxt-agent-menubar) are left" +
+		" over from an older version, grant nothing, and can be removed with “−”."
+
 	if p := selfPath(); p != "" {
-		// Inside an application bundle macOS lists the BUNDLE, under the app's
-		// name — so saying "switch on wxt-agent-session" would send somebody
-		// looking for a row that does not exist.
-		if app := enclosingApp(p); app != "" {
-			msg += fmt.Sprintf(
-				" Switch on %s in System Settings › Privacy & Security › %s.",
-				filepath.Base(app), right)
-		} else {
-			msg += fmt.Sprintf(
-				" Switch on %s in System Settings › Privacy & Security › %s.",
-				p, right)
-		}
 		msg += fmt.Sprintf(" (the process asking is %s)", p)
-	} else {
-		msg += fmt.Sprintf(" Switch wxt-agent on in System Settings › Privacy & Security › %s.", right)
 	}
 
-	// macOS asks once. A dismissed prompt never comes back, and a grant is
-	// recorded against the exact build it was given — so a row can be visibly
-	// on and grant nothing to the binary now asking.
+	// macOS asks once, and a dismissed prompt never comes back.
 	msg += " macOS asks only once, so a dismissed prompt will not reappear — switch it on yourself." +
-		" If it is already on, remove it with “−” and add it again: a grant made against an" +
-		" earlier build no longer applies. The agent restarts itself once the grant is in place."
+		" The agent restarts itself once the grant is in place."
 
 	return msg
-}
-
-// enclosingApp returns the .app bundle a path sits inside, or "".
-//
-// macOS attributes a privacy request from a binary inside a bundle to that
-// bundle, so the bundle is what the person will see listed — not the binary.
-func enclosingApp(path string) string {
-	for dir := filepath.Dir(path); dir != "/" && dir != "."; dir = filepath.Dir(dir) {
-		if filepath.Ext(dir) == ".app" {
-			return dir
-		}
-	}
-	return ""
 }

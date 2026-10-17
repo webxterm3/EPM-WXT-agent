@@ -134,14 +134,37 @@ func scopeAndOwnerForPath(path string) (scope, owner string) {
 // The order matters: CFBundleDisplayName is what Finder shows, CFBundleName is
 // often an abbreviated internal name, and the directory name is the last
 // resort — but it is also the only one guaranteed to exist.
+// bundleDisplayName is the name a person would call this application.
+//
+// The bundle's FOLDER NAME beats CFBundleName, and that ordering is the whole
+// point of this function. CFBundleName is a short internal name — Apple's own
+// guidance caps it at about 16 characters — so Visual Studio Code reports
+// "Code", Microsoft Word reports "Microsoft Word" only by luck, and plenty of
+// applications report something nobody has ever seen in the Finder.
+//
+// That mattered the moment policy arrived. Somebody looks at their
+// Applications folder, writes a rule for "Visual Studio Code", and it silently
+// matches nothing, because the inventory recorded "Code". The rule is correct,
+// the engine is correct, and the product does nothing — which is the worst
+// failure available to it.
+//
+// CFBundleDisplayName does not rescue it either, and that was the surprise:
+// Visual Studio Code sets BOTH CFBundleName and CFBundleDisplayName to
+// "Code". The Finder still shows "Visual Studio Code", because for a macOS
+// application the Finder shows the bundle's file name — CFBundleDisplayName
+// is mostly an iOS concern. So the folder name is the only field that agrees
+// with what a person is looking at while they write the rule.
+//
+// The plist fields remain as fallbacks for a bundle whose folder name is
+// missing or meaningless, which is the case this ordering gives up on.
 func bundleDisplayName(path string, info bundleInfo) string {
+	if n := collapseSpace(strings.TrimSuffix(filepath.Base(path), ".app")); n != "" {
+		return n
+	}
 	if n := collapseSpace(info.CFBundleDisplayName); n != "" {
 		return n
 	}
-	if n := collapseSpace(info.CFBundleName); n != "" {
-		return n
-	}
-	return collapseSpace(strings.TrimSuffix(filepath.Base(path), ".app"))
+	return collapseSpace(info.CFBundleName)
 }
 
 // sourceForPath marks OS-supplied applications.

@@ -14,6 +14,12 @@ CONFIG_DIR="@@CONFIG_DIR@@"
 LOG_DIR="@@LOG_DIR@@"
 DAEMON_LABEL="@@DAEMON_LABEL@@"
 
+# Contents/MacOS: the one place the product's executables live.
+#
+# They used to be duplicated into Contents/Resources as well, and every extra
+# copy is an extra path macOS can key a privacy row to — rows that no program
+# can remove afterwards. RES stays for the icon, which genuinely is a resource.
+BIN="$(cd "$(dirname "$0")" && pwd)"
 RES="$(cd "$(dirname "$0")/../Resources" && pwd)"
 AGENT="$INSTALL_DIR/wxt-agent"
 
@@ -87,7 +93,7 @@ do_install() {
     # somebody an authentication they did not need to give.
     #
     # The binary inside this bundle is used, because nothing is installed yet.
-    enroll="$("$RES/wxt-agent" prompt-enrolment --prefill "$clip" 2>/dev/null)" || exit 0
+    enroll="$("$BIN/wxt-agent" prompt-enrolment --prefill "$clip" 2>/dev/null)" || exit 0
 
     enroll="$(normalise_command "$enroll")"
     [ -n "$enroll" ] || dialog_error "No enrolment command was entered.\n\nCopy it from the portal, then open wxt-agent again."
@@ -131,17 +137,20 @@ xattr -dr com.apple.quarantine '/Applications/wxt-agent.app' 2>/dev/null || true
     local out
     out=$(run_privileged "set -e
 mkdir -p '$INSTALL_DIR' '$CONFIG_DIR/certs' '$LOG_DIR'
-cp '$RES/wxt-agent' '$INSTALL_DIR/wxt-agent'
+cp '$BIN/wxt-agent' '$INSTALL_DIR/wxt-agent'
 
-# The session helper is NOT installed here.
+# Only the agent is copied out of the bundle, and only so that wxt-agent works
+# as a command in a terminal.
 #
-# It lives inside the application bundle and runs from there, which is what
-# gives the product ONE row in System Settings instead of two. A loose copy in
-# /usr/local/bin is a second, unbundled program as far as macOS is concerned:
-# it gets its own row, with a generic executable icon, and granting one row
-# does nothing for the other. Anything an earlier install left there is removed
-# for the same reason.
-rm -f '$INSTALL_DIR/wxt-agent-session'
+# Everything that RUNS -- the daemon launchd starts, the menu bar item, the
+# session helper -- runs from inside the application bundle. macOS records a
+# privacy grant against the responsible process, which is whichever binary
+# launchd started, and launchctl asuser does not reset that. So a daemon
+# started from /usr/local/bin and one started from inside the bundle are two
+# different programs to System Settings, each with its own row, and granting
+# one does nothing for the other. Loose copies left by earlier installs are
+# removed for the same reason: nothing can delete the rows they collected.
+rm -f '$INSTALL_DIR/wxt-agent-session' '$INSTALL_DIR/wxt-agent-menubar'
 chmod 755 '$INSTALL_DIR/wxt-agent'
 # A file that arrived through a browser carries com.apple.quarantine, and the
 # attribute is copied along with it. Without this the agent is refused as
@@ -276,7 +285,7 @@ OSA
     else
         out=$(run_privileged "launchctl bootout system/$DAEMON_LABEL 2>/dev/null || true
 rm -f '/Library/LaunchDaemons/$DAEMON_LABEL.plist'
-rm -f '$INSTALL_DIR/wxt-agent' '$INSTALL_DIR/wxt-agent-session'
+rm -f '$INSTALL_DIR/wxt-agent' '$INSTALL_DIR/wxt-agent-session' '$INSTALL_DIR/wxt-agent-menubar'
 rm -rf '$CONFIG_DIR' '$LOG_DIR' '/Applications/wxt-agent.app'
 exit 0")
     fi

@@ -15,7 +15,7 @@ import (
 
 func uninstallPlan(keepConfig bool) []string {
 	plan := []string{
-		"the scheduled task (" + agent.WindowsTaskName + ")",
+		"the scheduled tasks (" + agent.WindowsTaskName + ", VsayAgentTray)",
 		winInstalledExe + " and the session helper",
 		"the Programs and Features entry",
 	}
@@ -42,6 +42,12 @@ func uninstallAgent(keepConfig bool) []string {
 	// The running processes, in case the task was ended but something lingers.
 	_ = exec.Command("taskkill", "/f", "/im", "wxt-agent-session.exe").Run()
 
+	// The tray icon has its own logon task and its own process; left behind,
+	// it sits in the notification area pointing at a binary that is gone.
+	_ = exec.Command("schtasks", "/end", "/tn", "VsayAgentTray").Run()
+	_ = exec.Command("schtasks", "/delete", "/tn", "VsayAgentTray", "/f").Run()
+	_ = exec.Command("taskkill", "/f", "/im", "wxt-agent-tray.exe").Run()
+
 	unregisterFromAddRemovePrograms()
 
 	remove := func(path string) {
@@ -55,6 +61,9 @@ func uninstallAgent(keepConfig bool) []string {
 	// scheduled for removal on the next boot instead.
 	remove(winConfigDir + `\` + "wxt-agent-session.exe")
 	remove(winConfigDir + `\` + "wxt-agent.ico")
+	remove(winConfigDir + `\` + "wxt-agent-tray.exe")
+	remove(winConfigDir + `\` + "wxt-agent-connected.ico")
+	remove(winConfigDir + `\` + "wxt-agent-disconnected.ico")
 	if !keepConfig {
 		remove(winConfigDir)
 	}

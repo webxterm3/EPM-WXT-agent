@@ -103,19 +103,54 @@ func TestBundleWithNoPackageTypeIsAccepted(t *testing.T) {
 	}
 }
 
-func TestBundleNameFallsBackThroughToTheDirectoryName(t *testing.T) {
+// The name recorded has to be the name somebody would type into a policy
+// rule, which is the name the Finder shows — the bundle's folder name — not
+// CFBundleName.
+//
+// CFBundleName is a short internal name; Apple's guidance caps it around 16
+// characters. Visual Studio Code sets it to "Code". Recording that meant an
+// operator who looked at their Applications folder, wrote a rule for "Visual
+// Studio Code" and saved it got a rule that matched nothing, with no error
+// anywhere — the policy was right, the engine was right, and the product did
+// nothing.
+func TestBundleNameIsWhatSomebodyWouldType(t *testing.T) {
 	cases := []struct {
 		name string
+		path string
 		info bundleInfo
 		want string
 	}{
-		{"display name wins", bundleInfo{CFBundleDisplayName: "Visual Studio Code", CFBundleName: "Code"}, "Visual Studio Code"},
-		{"bundle name next", bundleInfo{CFBundleName: "Code"}, "Code"},
-		{"directory name last", bundleInfo{}, "Some App"},
+		{
+			// The real case, with Visual Studio Code's real plist: it sets
+			// BOTH plist name fields to "Code", and the Finder still shows
+			// "Visual Studio Code". Neither plist field can be trusted here.
+			"the folder name beats both plist names",
+			"/Applications/Visual Studio Code.app",
+			bundleInfo{CFBundleDisplayName: "Code", CFBundleName: "Code"},
+			"Visual Studio Code",
+		},
+		{
+			"the display name is the fallback",
+			"/Applications/.app",
+			bundleInfo{CFBundleDisplayName: "Some App", CFBundleName: "SA"},
+			"Some App",
+		},
+		{
+			"the short bundle name is the last resort",
+			"/Applications/.app",
+			bundleInfo{CFBundleName: "Code"},
+			"Code",
+		},
+		{
+			"nothing but a folder name",
+			"/Applications/Some App.app",
+			bundleInfo{},
+			"Some App",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			app, ok := applicationFromBundle("/Applications/Some App.app", c.info, "")
+			app, ok := applicationFromBundle(c.path, c.info, "")
 			if !ok {
 				t.Fatal("rejected")
 			}
@@ -244,4 +279,27 @@ func must(app Application, ok bool) Application {
 		panic("applicationFromBundle rejected a fixture it should accept")
 	}
 	return app
+}
+
+// A policy rule is written by somebody looking at their Applications folder,
+// so the name recorded has to be the one shown there. This pins the specific
+// regression: reading CFBundleName made Visual Studio Code report "Code", and
+// a correct rule for "Visual Studio Code" matched nothing with no error
+// anywhere — the policy was right, the engine was right, and nothing happened.
+func TestTheFolderNameIsNotOverriddenByThePlist(t *testing.T) {
+	// Exactly what Visual Studio Code ships.
+	app, ok := applicationFromBundle(
+		"/Applications/Visual Studio Code.app",
+		bundleInfo{
+			CFBundleIdentifier:  "com.microsoft.VSCode",
+			CFBundleName:        "Code",
+			CFBundleDisplayName: "Code",
+		}, "")
+	if !ok {
+		t.Fatal("rejected")
+	}
+	if app.Name != "Visual Studio Code" {
+		t.Fatalf("Name = %q, want %q — a rule written against the Finder's name would not match",
+			app.Name, "Visual Studio Code")
+	}
 }

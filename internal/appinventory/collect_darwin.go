@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -47,12 +48,28 @@ type DarwinCollector struct {
 
 	// SkipSignatures turns off the codesign call.
 	//
-	// Signature reading is one process per application, which is the slow part
-	// of a scan. It is on by default because publisher is the single most
-	// useful field for writing policy — "allow anything signed by us" is the
-	// rule most organisations actually want — but it can be turned off on a
-	// machine where the scan cost matters more.
+	// It exists for tests and for a deliberate operator choice, and it must
+	// NOT be used to make a scan cheaper behind somebody's back.
+	//
+	// Enforcement once ran with this on, for speed. The publisher field came
+	// back empty for roughly half the applications on a Mac, every rule that
+	// named a publisher silently matched nothing, and the diagnostic — which
+	// used the full collector — cheerfully reported that the same rule DID
+	// match. Two collectors, two answers, and the one nobody could see was
+	// the one that decided. Hence the cache below instead.
 	SkipSignatures bool
+
+	// sigCache remembers signatures between scans, keyed by bundle and
+	// modification time.
+	//
+	// Reading a signature is one codesign process per application and is the
+	// whole cost of a macOS scan. Enforcement re-scans every couple of
+	// minutes, so without this the choice is a slow loop or a blind one. A
+	// bundle that has not been modified cannot have been re-signed, so its
+	// entry stays valid; one that has been modified misses the cache and is
+	// read again, which is exactly when it must be.
+	sigMu    sync.Mutex
+	sigCache map[string]cachedSignature
 
 	// SkipHomeDirectories turns off the per-user search.
 	//
@@ -63,7 +80,32 @@ type DarwinCollector struct {
 }
 
 // PlatformCollector returns the collector for this platform.
-func PlatformCollector() Collector { return &DarwinCollector{} }
+//
+// Two sources, because macOS has two. Application bundles are what a user
+// points at; Homebrew is how a developer's machine actually acquires most of
+// the software it runs, and a formula leaves no bundle anywhere for the first
+// collector to find.
+func PlatformCollector() Collector {
+	return &MultiCollector{
+		Label:      "macos",
+		Collectors: []Collector{&DarwinCollector{}, &HomebrewCollector{}},
+	}
+}
+
+// FastPlatformCollector is the SAME collector as PlatformCollector.
+//
+// It used to be a cheaper variant with signature reading turned off, and that
+// is how enforcement came to see an empty publisher for half the applications
+// on a Mac: every rule naming a publisher matched nothing, while the
+// diagnostic — which used the full collector — reported that it matched. Two
+// collectors cannot be allowed to answer the same question differently, so
+// there is now one, and the cost is handled by caching signatures rather than
+// by not reading them.
+//
+// The name is kept because callers that run often should keep saying which
+// they are; if a genuinely cheaper scan is ever needed it must drop something
+// no policy can match on.
+func FastPlatformCollector() Collector { return PlatformCollector() }
 
 func (c *DarwinCollector) Name() string { return "macos-bundles" }
 
@@ -77,6 +119,13 @@ func (c *DarwinCollector) roots() []string {
 	}
 	return roots
 }
+
+// UserApplicationDirs is each user profile's own Applications folder.
+//
+// Exported because application control watches the same places the inventory
+// reads: software installed without admin rights lands here, which is exactly
+// what a least-privilege policy is written about.
+func UserApplicationDirs() []string { return homeApplicationDirs() }
 
 // homeApplicationDirs returns each user profile's own Applications folder.
 //
@@ -166,7 +215,7 @@ func (c *DarwinCollector) readBundle(ctx context.Context, path string) (Applicat
 
 	authority := ""
 	if !c.SkipSignatures {
-		authority = readCodesignAuthority(ctx, path)
+		authority = c.signatureFor(ctx, path)
 	}
 
 	app, ok := applicationFromBundle(path, info, authority)
@@ -212,6 +261,56 @@ func readInfoPlist(ctx context.Context, path string) (bundleInfo, bool) {
 // is unsigned or cannot be read. Failure is not an error: an unsigned
 // application is a perfectly ordinary thing to find, and is itself worth
 // knowing about.
+// cachedSignature is one bundle's signing authority, and the modification
+// time it was read at.
+type cachedSignature struct {
+	modTime   time.Time
+	authority string
+}
+
+// signatureFor returns a bundle's signing authority, reading it at most once
+// per modification.
+func (c *DarwinCollector) signatureFor(ctx context.Context, path string) string {
+	mod, err := bundleModTime(path)
+	if err != nil {
+		// No modification time to key on, so nothing can be cached safely.
+		return readCodesignAuthority(ctx, path)
+	}
+
+	c.sigMu.Lock()
+	hit, ok := c.sigCache[path]
+	c.sigMu.Unlock()
+	if ok && hit.modTime.Equal(mod) {
+		return hit.authority
+	}
+
+	authority := readCodesignAuthority(ctx, path)
+	if authority == "" {
+		// A failure is NOT cached.
+		//
+		// An empty answer means codesign could not be run, was cut short by
+		// the enclosing timeout, or the bundle genuinely is unsigned — and
+		// nothing here can tell those apart. Remembering it would turn one
+		// slow scan into a permanently blind one for that application, which
+		// is precisely the failure this cache exists alongside: a publisher
+		// that is empty on the endpoint and populated in the portal, so every
+		// rule naming it silently matches nothing.
+		//
+		// An unsigned bundle therefore pays for a codesign call every scan.
+		// That is the right way round: the cost is bounded and visible, and
+		// the alternative is wrong answers that are neither.
+		return ""
+	}
+
+	c.sigMu.Lock()
+	if c.sigCache == nil {
+		c.sigCache = make(map[string]cachedSignature)
+	}
+	c.sigCache[path] = cachedSignature{modTime: mod, authority: authority}
+	c.sigMu.Unlock()
+	return authority
+}
+
 func readCodesignAuthority(ctx context.Context, path string) string {
 	runCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()

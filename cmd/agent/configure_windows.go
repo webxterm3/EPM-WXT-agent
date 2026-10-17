@@ -24,9 +24,11 @@ import (
 	"time"
 
 	"github.com/Yesveer/wxt-agent/internal/agent"
+	"github.com/Yesveer/wxt-agent/internal/brand"
 	"github.com/Yesveer/wxt-agent/internal/config"
 	"github.com/Yesveer/wxt-agent/internal/remotecontrol"
 	"github.com/Yesveer/wxt-agent/internal/remotecontrol/helperbin"
+	"github.com/Yesveer/wxt-agent/internal/traybin"
 )
 
 // Windows install layout — mirrors the Unix /etc/vsay layout under ProgramData.
@@ -195,6 +197,16 @@ func runConfigureWindows(p configureParams) error {
 	// appears in no list and that nobody can remove through Control Panel.
 	registerInAddRemovePrograms(winInstalledExe, winConfigDir, version)
 	fmt.Println("✓ Listed in Control Panel → Programs and Features as \"wxt-agent\"")
+
+	// 10. The notification-area icon.
+	if err := setupTrayIcon(); err != nil {
+		// Cosmetic. The agent works perfectly without a tray icon, and an
+		// enrolment that otherwise succeeded must not be reported as failed
+		// because an icon could not be installed.
+		fmt.Printf("Warning: could not install the tray icon: %v\n", err)
+	} else {
+		fmt.Println("✓ Tray icon installed (appears at next sign-in, and now)")
+	}
 	fmt.Println("")
 	fmt.Println("Check task:  schtasks /query /tn", winTaskName)
 	fmt.Println("Stop agent:  schtasks /end /tn", winTaskName)
@@ -580,4 +592,69 @@ func trimTrailingSlash(s string) string {
 		s = s[:len(s)-1]
 	}
 	return s
+}
+
+// winTrayExe is the notification-area program, beside the agent.
+const winTrayExe = winConfigDir + `\wxt-agent-tray.exe`
+
+// winTrayTask is the per-user logon task that starts it.
+//
+// A separate task from the agent's, with a different trigger, because the two
+// run as different accounts for different reasons: the agent is SYSTEM at
+// startup, and the tray is the signed-in person at sign-in. A SYSTEM process
+// has no desktop to draw a tray icon on.
+const winTrayTask = "VsayAgentTray"
+
+// setupTrayIcon installs the tray program, its two state icons, and the logon
+// task that starts it.
+func setupTrayIcon() error {
+	// From inside this binary first.
+	//
+	// The agent ships as ONE downloadable file, and the first report of this
+	// feature was "the tray program is not beside the agent" — from a machine
+	// where the bare .exe had been downloaded on its own, which is the normal
+	// way to install. A copy on disk is still accepted, for a build made
+	// without the embed step.
+	if _, err := traybin.Extract(winTrayExe); err != nil {
+		src := filepath.Join(filepath.Dir(mustExecutable()), "wxt-agent-tray.exe")
+		if _, statErr := os.Stat(src); statErr != nil {
+			return fmt.Errorf("this build carries no tray program and none is beside the agent")
+		}
+		if err := copyExecutable(src, winTrayExe); err != nil {
+			return fmt.Errorf("installing the tray program: %w", err)
+		}
+	}
+
+	// The icons are written from the binary rather than copied, so they cannot
+	// fail to travel with it.
+	for name, data := range map[string][]byte{
+		"wxt-agent-connected.ico":    brand.IconConnected,
+		"wxt-agent-disconnected.ico": brand.IconDisconnected,
+	} {
+		if err := os.WriteFile(filepath.Join(winConfigDir, name), data, 0644); err != nil { // #nosec G306 -- artwork, meant to be read
+			return fmt.Errorf("writing %s: %w", name, err)
+		}
+	}
+
+	// /sc onlogon with no /ru runs as whoever signs in, in their session —
+	// which is the only place a tray icon can exist.
+	tr := fmt.Sprintf(`"%s"`, winTrayExe)
+	if out, err := exec.Command("schtasks", "/create",
+		"/tn", winTrayTask, "/tr", tr,
+		"/sc", "onlogon", "/f").CombinedOutput(); err != nil {
+		return fmt.Errorf("creating the logon task: %v (%s)", err, string(out))
+	}
+
+	// Started now as well, so the icon appears without waiting for a sign-out.
+	_ = exec.Command("schtasks", "/run", "/tn", winTrayTask).Run()
+	return nil
+}
+
+// mustExecutable returns this program's path, or "." when it cannot be found.
+func mustExecutable() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	return exe
 }

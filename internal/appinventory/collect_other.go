@@ -11,5 +11,9 @@ import "context"
 // would read as "this machine has no software installed".
 func PlatformCollector() Collector { return nil }
 
+// FastPlatformCollector matches PlatformCollector: there is nothing to make
+// faster when there is nothing to collect.
+func FastPlatformCollector() Collector { return nil }
+
 // unusedContext keeps the import honest on platforms with no collector.
 var _ = context.Background

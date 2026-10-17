@@ -88,6 +88,14 @@ type EffectiveRule struct {
 	PolicyName string `json:"policy_name"`
 	Scope      string `json:"scope"`
 	Mode       string `json:"mode"`
+
+	// RemoveBlocked carries the owning policy's choice about how hard a block
+	// should bite: stop it launching, or move it off the machine altogether.
+	//
+	// It travels on the RULE rather than on the policy as a whole because
+	// rules from several policies are flattened into one list here, and by
+	// the time a decision is made there is no policy left to ask.
+	RemoveBlocked bool `json:"remove_blocked,omitempty"`
 }
 
 // Effective is the whole policy for this machine, in evaluation order. It is
@@ -119,6 +127,15 @@ type Decision struct {
 	// the action is still reported — that is the point of audit — but nothing
 	// acts on it.
 	Enforced bool
+
+	// Remove asks for a blocked application to be moved off the machine
+	// rather than merely prevented from launching.
+	//
+	// Only ever true alongside Action == ActionBlock. It is false whenever the
+	// policy default decided rather than a rule, because a catch-all that
+	// swept somebody's whole Applications folder into quarantine is not
+	// something a default should be able to express.
+	Remove bool
 }
 
 // Evaluate returns what the policy says about one program.
@@ -139,6 +156,9 @@ func (e *Effective) Evaluate(p Program) Decision {
 		return Decision{
 			Action: action, Rule: er.Rule.Name,
 			PolicyName: er.PolicyName, Enforced: enforced,
+			// Removal is a property of the rule that matched, and only
+			// meaningful for a block.
+			Remove: er.RemoveBlocked && action == ActionBlock,
 		}
 	}
 

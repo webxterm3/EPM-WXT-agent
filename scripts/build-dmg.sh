@@ -31,6 +31,14 @@ TEMPLATE_DIR="scripts/macos-app"
 ICON_SCRIPT="scripts/icon/make-icon.py"
 BUNDLE_PREFIX="${MACOS_BUNDLE_PREFIX:-io.coredge.epm}"
 SIGN_ID="${MACOS_SIGN_ID:--}"
+SIGN_KEYCHAIN="${MACOS_SIGN_KEYCHAIN:-$HOME/.wxt-agent/signing.keychain-db}"
+
+# codesign does not search a keychain that is not on the user's search list,
+# and putting it there would be a side effect on the developer's machine.
+KEYCHAIN_ARG=()
+if [ "$SIGN_ID" != "-" ] && [ -f "$SIGN_KEYCHAIN" ]; then
+    KEYCHAIN_ARG=(--keychain "$SIGN_KEYCHAIN")
+fi
 
 # The paths the agent actually installs to. They are substituted into both app
 # bundles from here so the installer and the uninstaller cannot drift apart —
@@ -112,21 +120,31 @@ create_dmg() {
     write_info_plist "$APP/Contents" "wxt-agent" "${BUNDLE_PREFIX}.app" "wxt-agent-app"
     render_template "$TEMPLATE_DIR/wxt-agent-app.sh" "$APP/Contents/MacOS/wxt-agent-app"
 
-    cp "$BIN_SOURCE" "$APP/Contents/Resources/wxt-agent"
-    chmod +x "$APP/Contents/Resources/wxt-agent"
-    if [ -f "$HELPER_SOURCE" ]; then
-        cp "$HELPER_SOURCE" "$APP/Contents/Resources/wxt-agent-session"
-        chmod +x "$APP/Contents/Resources/wxt-agent-session"
+    # ONE copy of each executable, all of them in Contents/MacOS.
+    #
+    # Contents/MacOS is where macOS expects a bundle's executables, and more to
+    # the point it is the only place they can run from and still count as part
+    # of the application. macOS records a privacy grant against the
+    # RESPONSIBLE process — the topmost launchd-started ancestor of whoever
+    # calls the API, which `launchctl asuser` does not reset — so a daemon
+    # started from /usr/local/bin and a daemon started from inside the bundle
+    # produce two different rows in System Settings for the same product.
+    #
+    # There used to be a second copy of each in Contents/Resources as well.
+    # Every extra copy is an extra path, every path is a potential privacy
+    # client, and the rows they collect cannot be removed by any program.
+    cp "$BIN_SOURCE" "$APP/Contents/MacOS/wxt-agent"
+    chmod +x "$APP/Contents/MacOS/wxt-agent"
 
-        # The helper ALSO lives inside Contents/MacOS, and that copy is the one
-        # that actually runs.
-        #
-        # macOS attributes a privacy request made by a binary inside an
-        # application bundle to the BUNDLE. Run from /usr/local/bin the helper
-        # is its own unbundled program, so System Settings lists it separately
-        # from the agent — two rows, two switches, for one product. Run from
-        # inside the bundle there is one row, named and iconed like the app,
-        # and granting it covers everything.
+    MENUBAR_SOURCE="$DIST_DIR/bin/darwin-${ARCH}/wxt-agent-menubar"
+    if [ -f "$MENUBAR_SOURCE" ]; then
+        cp "$MENUBAR_SOURCE" "$APP/Contents/MacOS/wxt-agent-menubar"
+        chmod +x "$APP/Contents/MacOS/wxt-agent-menubar"
+    else
+        echo -e "${YELLOW}  Warning: menu bar item missing for darwin-$ARCH${NC}"
+    fi
+
+    if [ -f "$HELPER_SOURCE" ]; then
         cp "$HELPER_SOURCE" "$APP/Contents/MacOS/wxt-agent-session"
         chmod +x "$APP/Contents/MacOS/wxt-agent-session"
     else
@@ -148,13 +166,57 @@ create_dmg() {
         echo -e "${YELLOW}  Warning: could not build the icon (needs python3 with Pillow)${NC}"
     fi
 
-    # Signed for the same reason the binaries are: an unsigned bundle has no
-    # code identity, so macOS has nothing to key a grant to and Gatekeeper has
-    # nothing to check. Ad-hoc unless a Developer ID is supplied.
-    if codesign --force --deep --sign "$SIGN_ID" "$APP" >/dev/null 2>&1; then
+    # Signed inside-out, and deliberately NOT with --deep.
+    #
+    # --deep re-signs every nested binary with an identifier codesign makes up
+    # from the file name, throwing away the identifiers the build gave them.
+    # The session helper's identifier is part of the requirement macOS stores
+    # its Accessibility and Screen Recording grants against, so losing it here
+    # loses the grants — the exact failure this signing work exists to stop.
+    # Apple discourage --deep for the same reason.
+    # The nested binaries are NOT re-signed here.
+    #
+    # The build already signed each one with the identifier it must carry
+    # (Makefile: sign_macos_identified). Re-signing them again here used
+    # different options — no --options runtime — which produced a bundle copy
+    # of the session helper that differed byte-for-byte from the copy embedded
+    # inside the agent. The agent compares the two on every start and rewrites
+    # the installed helper when they differ, which broke the application
+    # bundle's seal and invalidated the privacy grant it had been given, over
+    # and over, with nothing in any log to say so.
+    #
+    # Signing the bundle itself does not touch them; it seals them.
+    sign_ok=1
+    if codesign --force "${KEYCHAIN_ARG[@]}" --sign "$SIGN_ID" "$APP" >/dev/null 2>&1 && [ "$sign_ok" = 1 ]; then
         echo "  ✓ signed wxt-agent.app"
     else
         echo -e "${YELLOW}  Warning: could not sign wxt-agent.app${NC}"
+    fi
+
+    # The requirement is the whole point, so it is checked rather than assumed.
+    # A fallback to ad-hoc still builds, still runs, and still throws away
+    # every permission grant on every machine that upgrades.
+    helper="$APP/Contents/MacOS/wxt-agent-session"
+    if [ "$SIGN_ID" != "-" ] && [ -f "$helper" ]; then
+        if codesign -d -r- "$helper" 2>&1 | grep -q 'designated.*certificate'; then
+            echo "  ✓ permission grants will survive a rebuild"
+        else
+            echo -e "${YELLOW}  Warning: the helper has a per-build identity — grants will not survive${NC}"
+        fi
+
+        # One permission, not several: the helper's requirement has to be the
+        # SAME STRING as the application's, or macOS treats them as two
+        # programs and asks twice.
+        app_req="$(codesign -d -r- "$APP" 2>&1 | grep '^designated' || true)"
+        helper_req="$(codesign -d -r- "$helper" 2>&1 | grep '^designated' || true)"
+        if [ -n "$app_req" ] && [ "$app_req" = "$helper_req" ]; then
+            echo "  ✓ one permission covers the whole product"
+        else
+            echo -e "${YELLOW}  Warning: the helper has a different code identity to the app.${NC}"
+            echo "      app:    $app_req"
+            echo "      helper: $helper_req"
+            echo "    macOS will ask for a separate permission for each."
+        fi
     fi
 
     # The /Applications link is what makes this read as an ordinary Mac

@@ -24,3 +24,15 @@ func bundleHelperDir() string {
 	}
 	return macAppHelperDir
 }
+
+// BundleHelperPath is the helper inside the application bundle, or "".
+//
+// Exported for the installer, which needs to know whether the bundle is the
+// canonical home before deciding whether to write a second copy elsewhere.
+func BundleHelperPath() string {
+	dir := bundleHelperDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "wxt-agent-session")
+}

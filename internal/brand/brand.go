@@ -15,3 +15,16 @@ import _ "embed"
 //
 //go:embed wxt-agent.ico
 var Icon []byte
+
+// IconConnected and IconDisconnected are the Windows notification-area icons.
+//
+// Two ready-made images rather than one with an overlay composited at runtime:
+// the tray wants an HICON and swapping between two is a single call, whereas
+// compositing with GDI on every state change is a pile of device contexts to
+// leak.
+//
+//go:embed wxt-agent-connected.ico
+var IconConnected []byte
+
+//go:embed wxt-agent-disconnected.ico
+var IconDisconnected []byte

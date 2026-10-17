@@ -27,6 +27,7 @@ import (
 	"github.com/Yesveer/wxt-agent/internal/agent"
 	"github.com/Yesveer/wxt-agent/internal/config"
 	"github.com/Yesveer/wxt-agent/internal/remotecontrol/helperbin"
+	"github.com/Yesveer/wxt-agent/internal/traybin"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -55,6 +56,14 @@ func main() {
 			// Whether the session helper is bundled decides whether remote
 			// control works at all, and it is otherwise invisible — a build
 			// missing it looks identical until someone tries to connect.
+			// The status-area program, for the same reason: a build missing
+			// it installs with a warning nobody reads and no icon appears,
+			// which looks identical to a build that has it.
+			if traybin.Available() {
+				fmt.Printf("status-area program: bundled (%.1f MB)\n", float64(traybin.Size())/(1<<20))
+			} else {
+				fmt.Println("status-area program: NOT bundled — no menu bar or tray icon")
+			}
 			if helperbin.Available() {
 				fmt.Printf("session helper: bundled (%.1f MB)\n", float64(helperbin.Size())/(1<<20))
 			} else {
@@ -121,7 +130,12 @@ func main() {
 	// Permission diagnostics: the only way to tell "the grant is missing" from
 	// "the grant exists but does not apply to this build", which look
 	// identical from System Settings.
+	rootCmd.AddCommand(newPolicyStatusCommand())
 	rootCmd.AddCommand(newCheckPermissionsCommand())
+	// nil on platforms with no privacy database to repair.
+	if repair := newRepairPermissionsCommand(); repair != nil {
+		rootCmd.AddCommand(repair)
+	}
 
 	// Used by the macOS application to ask for the enrolment command in a real
 	// text area; AppleScript's dialog only offers a single line.

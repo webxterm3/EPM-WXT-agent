@@ -25,8 +25,11 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/Yesveer/wxt-agent/internal/agentstatus"
+	"github.com/Yesveer/wxt-agent/internal/appcontrol"
 	"github.com/Yesveer/wxt-agent/internal/config"
 	"github.com/Yesveer/wxt-agent/internal/executor"
 	"github.com/Yesveer/wxt-agent/internal/filesystem"
@@ -90,6 +93,25 @@ type Agent struct {
 
 	// policies holds the application-control policy this machine is under.
 	policies *policyStore
+
+	// appControl enforces that policy on the software installed here. It is
+	// nil until SetConfigPath has run, and a no-op whenever the policy it
+	// reads is absent or in audit mode.
+	appControl *appcontrol.Enforcer
+
+	// connected mirrors what publishStatus last reported, so the heartbeat can
+	// republish the current answer without reaching into the stream loop.
+	connected atomic.Bool
+
+	// permOK and permNote hold the last observed macOS privacy state.
+	//
+	// Published for the menu bar item, which must never ask for itself: macOS
+	// attributes a privacy request to the responsible process at the head of
+	// the chain, so a menu bar item that ran the check would create a System
+	// Settings row in its own name — one that grants nothing and that no
+	// program can remove. One asker, many readers.
+	permOK   atomic.Bool
+	permNote atomic.Pointer[string]
 }
 
 // New creates a new agent
@@ -144,8 +166,77 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 		return fmt.Errorf("grpc client not connected")
 	})
 
+	// The agent is the only process that asks macOS about privacy grants, and
+	// the only one that publishes the answer. Republished immediately so the
+	// menu bar reflects a refusal without waiting for the next heartbeat.
+	agent.remoteControl.SetPermissionReporter(func(ok bool, note string) {
+		agent.permOK.Store(ok)
+		agent.permNote.Store(&note)
+		agent.publishStatus(agent.connected.Load(), "")
+	})
+
 	return agent, nil
 }
+
+// publishStatus writes what the agent is doing, for the menu bar item.
+//
+// Called at the moments the answer changes rather than on a timer, so the icon
+// turns the instant a connection drops rather than up to a tick later. A
+// keepalive refresh runs alongside it — see statusHeartbeat — because a reader
+// cannot tell "disconnected" from "the agent died" without a recent timestamp.
+//
+// Never fatal and never logged above Debug: this is a cosmetic channel, and an
+// agent that cannot write it still works perfectly.
+func (a *Agent) publishStatus(connected bool, lastErr string) {
+	st := agentstatus.Status{
+		Connected: connected,
+		AgentID:   a.agentID,
+		Machine:   a.config.Agent.Name,
+		Server:    a.config.Server.Host,
+		Version:   BuildVersion,
+		TenantID:  a.config.Tenant.ID,
+		LastError: lastErr,
+
+		PermissionsOK: a.permOK.Load(),
+	}
+	if note := a.permNote.Load(); note != nil {
+		st.PermissionNote = *note
+	}
+	a.connected.Store(connected)
+
+	if err := agentstatus.Write(st); err != nil {
+		a.logger.Debug("Could not publish agent status", zap.Error(err))
+	}
+}
+
+// statusHeartbeat keeps the published status fresh.
+//
+// Without it a stopped agent leaves a file saying "connected" for ever, and
+// the menu bar would show a green tick for a process that is not running. The
+// reader treats anything older than a couple of intervals as unknown.
+func (a *Agent) statusHeartbeat(ctx context.Context, connected func() bool) {
+	ticker := time.NewTicker(statusHeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// A clean shutdown says so, so the icon does not sit on a stale
+			// green tick until the file ages out.
+			a.publishStatus(false, "the agent is stopping")
+			return
+		case <-ticker.C:
+			a.publishStatus(connected(), "")
+		}
+	}
+}
+
+// statusHeartbeatInterval is how often the status file is refreshed.
+//
+// Short enough that a reader can call anything older than ~3 intervals dead,
+// and long enough to be a rounding error against everything else the agent
+// does.
+const statusHeartbeatInterval = 15 * time.Second
 
 // Start starts the agent.
 func (a *Agent) Start(ctx context.Context) error {
@@ -153,6 +244,12 @@ func (a *Agent) Start(ctx context.Context) error {
 		zap.String("linux_user", a.config.LinuxUser.Username),
 		zap.String("server", a.config.Server.Host),
 	)
+
+	// Publish "not connected yet" immediately, so the menu bar has something
+	// truthful to show while the first connection is being made rather than
+	// nothing at all.
+	a.publishStatus(false, "starting")
+	go a.statusHeartbeat(ctx, a.connected.Load)
 
 	// The agent deliberately does NOT ask macOS for Screen Recording or
 	// Accessibility.
@@ -182,6 +279,16 @@ func (a *Agent) Start(ctx context.Context) error {
 			a.logger.Warn("Failed to stop the session helper", zap.Error(err))
 		}
 	}()
+
+	// Application control runs for the full agent lifetime, NOT per connection
+	// like the reporting loops below.
+	//
+	// The policy is read from disk, so a machine that loses the network keeps
+	// enforcing what it was last told. Tying this to a connection would mean a
+	// laptop quietly opening up the moment it left the office, which is both
+	// the opposite of what anybody would assume and the easiest way to get
+	// around it.
+	a.startAppControl(ctx)
 
 	// caFingerprintLoop runs for the full agent lifetime. It uses recoveryHTTPClient
 	// (InsecureSkipVerify) so it works even when the pinned CA is stale, and checks
@@ -260,6 +367,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		// Reset retry delay on successful connection
 		retryDelay = 5 * time.Second
 		a.logger.Info("Agent connected and registered successfully", zap.String("agent_id", a.agentID))
+		a.publishStatus(true, "")
 
 		// Start tunnel client once, after agentID is known from registration
 		if a.config.Tunnel.Enabled && a.config.Tunnel.URL != "" {
@@ -316,6 +424,7 @@ func (a *Agent) Start(ctx context.Context) error {
 
 		if streamErr != nil {
 			a.logger.Warn("Stream disconnected, will reconnect...", zap.Error(streamErr), zap.Duration("retry_in", retryDelay))
+			a.publishStatus(false, streamErr.Error())
 			time.Sleep(retryDelay)
 			retryDelay = min(retryDelay*2, maxRetryDelay)
 			continue

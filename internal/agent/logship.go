@@ -173,4 +173,10 @@ func (a *Agent) SetConfigPath(path string) {
 	// The policy store lives beside the config file, so it can only be built
 	// once that path is known. Done here rather than in New for that reason.
 	a.policies = newPolicyStore(filepath.Dir(path), a.logger)
+
+	// The enforcer reads that store, and keeps its record of what it has
+	// locked beside it. Built here rather than when a connection comes up so
+	// that `wxt-agent uninstall` can ask it to restore everything without
+	// having to reach a server first.
+	a.newAppControl(appControlStateDir(path))
 }

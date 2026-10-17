@@ -130,4 +130,11 @@ func (a *Agent) handleAppPolicy(payload string) {
 		// a policy that watches and one that acts, and it is the first thing
 		// anybody reading these logs needs to know.
 		zap.Bool("enforcing", eff.Mode == apppolicy.ModeEnforce))
+
+	// Applied now rather than at the next tick. An operator who has just
+	// pressed Save is watching the machine, and two minutes of nothing
+	// happening reads as the policy not having arrived.
+	if a.appControl != nil {
+		a.appControl.Kick()
+	}
 }

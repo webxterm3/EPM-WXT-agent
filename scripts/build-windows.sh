@@ -87,6 +87,16 @@ create_windows_package() {
     cp "$BIN_SOURCE" "$PKG_DIR/wxt-agent/wxt-agent.exe"
     cp "$HELPER_SOURCE" "$PKG_DIR/wxt-agent/wxt-agent-session.exe"
 
+    # The notification-area program travels beside the agent, which is where
+    # configure looks for it. Anything that has to arrive separately
+    # eventually does not.
+    TRAY_SOURCE="$DIST_DIR/bin/windows-${ARCH}/wxt-agent-tray.exe"
+    if [ -f "$TRAY_SOURCE" ]; then
+        cp "$TRAY_SOURCE" "$PKG_DIR/wxt-agent/wxt-agent-tray.exe"
+    else
+        echo -e "${YELLOW}  Warning: tray program missing for windows-$ARCH${NC}"
+    fi
+
     # Create install script (PowerShell)
     cat > "$PKG_DIR/wxt-agent/install.ps1" << 'PSEOF'
 # VSay Agent Installer for Windows
@@ -116,6 +126,9 @@ Copy-Item -Path ".\wxt-agent.exe" -Destination "$installDir\wxt-agent.exe" -Forc
 
 # The session helper must live beside the agent — that is where the agent
 # looks for it when an admin starts a remote-control session.
+if (Test-Path ".\wxt-agent-tray.exe") {
+    Copy-Item -Path ".\wxt-agent-tray.exe" -Destination "$installDir\wxt-agent-tray.exe" -Force
+}
 if (Test-Path ".\wxt-agent-session.exe") {
     Copy-Item -Path ".\wxt-agent-session.exe" -Destination "$installDir\wxt-agent-session.exe" -Force
     Write-Host "Session helper installed (required for remote control)" -ForegroundColor Green
@@ -151,6 +164,9 @@ VSay Agent ${VERSION} for Windows
 CONTENTS:
   wxt-agent.exe          the agent daemon
   wxt-agent-session.exe  the session helper, required for remote control.
+  wxt-agent-tray.exe     the notification-area icon: shows whether the agent is
+                         connected, and gives access to its status, permissions
+                         and logs.
                          It MUST sit in the same folder as wxt-agent.exe.
 
 INSTALLATION:

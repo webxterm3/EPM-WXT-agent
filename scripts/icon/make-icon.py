@@ -181,6 +181,48 @@ def svg_mark() -> str:
     )
 
 
+def badged_icon(connected: bool) -> Image.Image:
+    """The icon with a status badge, for the Windows notification area.
+
+    Two ready-made images rather than one icon with an overlay drawn at
+    runtime: the tray asks for an HICON and swapping between two is a single
+    call, whereas compositing one with GDI at every state change is a pile of
+    device contexts to leak.
+
+    The badge is deliberately large and high-contrast. This is rendered at
+    16x16 in a crowded tray, next to a dozen other icons, and the one thing it
+    has to answer across a room is "green or red".
+    """
+    icon = draw_icon()
+    d = ImageDraw.Draw(icon)
+
+    # Bottom-right quadrant, in a filled disc so the mark reads against the
+    # shield behind it at any size.
+    cx, cy, r = SIZE * 0.715, SIZE * 0.715, SIZE * 0.225
+    fill = (46, 184, 114) if connected else (219, 68, 68)
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=fill)
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=BG_BOTTOM, width=int(SIZE * 0.022))
+
+    w = int(SIZE * 0.045)
+    mark = (255, 255, 255)
+    if connected:
+        d.line([(cx - r * 0.45, cy), (cx - r * 0.08, cy + r * 0.38), (cx + r * 0.5, cy - r * 0.42)],
+               fill=mark, width=w, joint="curve")
+    else:
+        a = r * 0.42
+        d.line([(cx - a, cy - a), (cx + a, cy + a)], fill=mark, width=w)
+        d.line([(cx + a, cy - a), (cx - a, cy + a)], fill=mark, width=w)
+
+    return icon
+
+
+def write_ico(img: Image.Image, path: str):
+    """A multi-size .ico. Windows picks a size out of it, and a single large
+    entry scaled down to 16px in the tray turns to mush."""
+    img.save(path, format="ICO",
+             sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)])
+
+
 def main(out_dir: str):
     icon = draw_icon()
     iconset = os.path.join(out_dir, "wxt-agent.iconset")
@@ -205,6 +247,10 @@ def main(out_dir: str):
         os.path.join(out_dir, "favicon.ico"), format="ICO",
         sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
 
+    # The two tray states.
+    write_ico(badged_icon(True), os.path.join(out_dir, "wxt-agent-connected.ico"))
+    write_ico(badged_icon(False), os.path.join(out_dir, "wxt-agent-disconnected.ico"))
+
     with open(os.path.join(out_dir, "wxt-agent-mark.svg"), "w") as f:
         f.write(svg_mark())
 
@@ -217,6 +263,8 @@ def main(out_dir: str):
 
     for src, dst in [
         ("favicon.ico", os.path.join(repo, "internal", "brand", "wxt-agent.ico")),
+        ("wxt-agent-connected.ico", os.path.join(repo, "internal", "brand", "wxt-agent-connected.ico")),
+        ("wxt-agent-disconnected.ico", os.path.join(repo, "internal", "brand", "wxt-agent-disconnected.ico")),
         ("favicon.ico", os.path.join(frontend, "favicon.ico")),
         ("icon.png", os.path.join(frontend, "icon.png")),
         ("wxt-agent-mark.svg", os.path.join(frontend, "mark.svg")),

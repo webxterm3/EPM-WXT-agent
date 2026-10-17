@@ -60,11 +60,19 @@ func (c *Controller) watchForPermissions() {
 	go func() {
 		defer c.permWatch.Store(false)
 
+		// The cooldown gates only the SPECULATIVE restart below.
+		//
+		// It used to gate the whole watch, which meant that somebody who
+		// granted the permission within fifteen minutes of a previous restart
+		// was told "not so soon" and nothing happened — the one case where
+		// restarting is certainly the right thing. A confirmed grant is not a
+		// guess and does not need rationing.
+		recentlyRestarted := false
 		if since, ok := timeSinceLastRestart(); ok && since < permissionRestartCooldown {
-			c.logger.Info("Not restarting for permissions again so soon",
+			recentlyRestarted = true
+			c.logger.Info("Restarted recently; will restart again only if the permissions actually arrive",
 				zap.Duration("since_last", since.Round(time.Second)),
 				zap.Duration("cooldown", permissionRestartCooldown))
-			return
 		}
 
 		deadline := time.Now().Add(permissionGracePeriod)
@@ -76,10 +84,19 @@ func (c *Controller) watchForPermissions() {
 				continue
 			}
 			if c.permissionsGranted() {
+				c.reportPermissions(true, "")
 				c.restart("the permissions are now granted")
 				return
 			}
 			if time.Now().After(deadline) {
+				if recentlyRestarted {
+					// A restart has already been tried and did not help, and
+					// the check still says no. Repeating it every minute for
+					// ever helps nobody.
+					c.logger.Info("The permissions are still not granted, and a restart has already been tried",
+						zap.String("next", "waiting for the grant itself"))
+					return
+				}
 				// The check says no, but it has been wrong before and a
 				// restart is what fixes this. Better one restart that was
 				// not needed than a machine that stays broken.

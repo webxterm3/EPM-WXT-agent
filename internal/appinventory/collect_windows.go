@@ -29,7 +29,22 @@ type WindowsCollector struct {
 }
 
 // PlatformCollector returns the collector for this platform.
-func PlatformCollector() Collector { return &WindowsCollector{} }
+// PlatformCollector returns the collector for this platform.
+//
+// The uninstall registry plus Chocolatey. Most Chocolatey packages register an
+// uninstall entry and are found twice — de-duplication handles that — but
+// portable and command-line packages register nothing at all, and those are
+// the ones somebody installs precisely because they need no admin rights.
+func PlatformCollector() Collector {
+	return &MultiCollector{
+		Label:      "windows",
+		Collectors: []Collector{&WindowsCollector{}, &ChocolateyCollector{}},
+	}
+}
+
+// FastPlatformCollector is the same set. Reading the registry is cheap, so
+// unlike macOS there is nothing to leave out.
+func FastPlatformCollector() Collector { return PlatformCollector() }
 
 func (c *WindowsCollector) Name() string { return "windows-registry" }
 

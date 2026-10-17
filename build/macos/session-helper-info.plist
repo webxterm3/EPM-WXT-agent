@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.coredge.epm.app</string>
+	<key>CFBundleName</key>
+	<string>wxt-agent</string>
+	<key>CFBundleDisplayName</key>
+	<string>wxt-agent</string>
+	<key>CFBundleExecutable</key>
+	<string>wxt-agent-session</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleIconFile</key>
+	<string>wxt-agent</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>EPM needs to see the screen so an administrator can support this Mac remotely.</string>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>EPM needs to control the pointer and keyboard so an administrator can support this Mac remotely.</string>
+</dict>
+</plist>

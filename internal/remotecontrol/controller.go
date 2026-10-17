@@ -53,6 +53,15 @@ type Controller struct {
 	// refused sessions starts one watcher rather than one per attempt.
 	permWatch atomic.Bool
 
+	// permReport is told whenever the macOS privacy state is observed.
+	//
+	// The agent publishes it for the menu bar item to read, because the menu
+	// bar must never ask for itself: macOS attributes a privacy request to the
+	// responsible process at the head of the chain, so a menu bar item that
+	// ran the check would put its own name in System Settings — a row that
+	// grants nothing and cannot be removed programmatically.
+	permReport atomic.Pointer[func(ok bool, note string)]
+
 	// send delivers a message back to the backend on the given session.
 	send func(sessionID string, data []byte) error
 
@@ -427,6 +436,7 @@ func (c *Controller) onHelperEvent(e ipc.Event) {
 	// showed session after session failing with nothing reacting to it.
 	if e.State == ipc.StateError && isPermissionDenied(errors.New(e.Message)) {
 		c.logger.Info("Session refused for want of a macOS permission; watching for it to be granted")
+		c.reportPermissions(false, e.Message)
 		// Reported to the backend first — dropping the helper closes the
 		// connection this event arrived on, and the portal still needs to be
 		// told why the session failed.
@@ -555,4 +565,20 @@ func intField(m map[string]any, key string) int {
 		return v
 	}
 	return 0
+}
+
+// SetPermissionReporter registers the callback told about macOS privacy state.
+//
+// Optional: nothing here depends on it, and an agent that never sets one works
+// exactly as before. It exists so the state can be published once, by the one
+// process that is allowed to ask, and read by everything else.
+func (c *Controller) SetPermissionReporter(fn func(ok bool, note string)) {
+	c.permReport.Store(&fn)
+}
+
+// reportPermissions passes an observation on, if anybody is listening.
+func (c *Controller) reportPermissions(ok bool, note string) {
+	if fn := c.permReport.Load(); fn != nil && *fn != nil {
+		(*fn)(ok, note)
+	}
 }

@@ -179,4 +179,11 @@ func (a *Agent) reportAppInventory(ctx context.Context, collector appinventory.C
 		zap.Int("chunks", sent),
 		zap.Duration("scan_took", time.Since(started)),
 		zap.String("collect_error", collectErrText))
+
+	// A fresh scan is also fresh evidence for enforcement: it is what carries
+	// the publisher of a newly installed application, which a reconcile pass
+	// does not read for itself.
+	if a.appControl != nil {
+		a.appControl.Kick()
+	}
 }
