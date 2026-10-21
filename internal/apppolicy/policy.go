@@ -136,6 +136,26 @@ type Decision struct {
 	// swept somebody's whole Applications folder into quarantine is not
 	// something a default should be able to express.
 	Remove bool
+
+	// FromRule is true when a rule decided, false when the policy's default
+	// action did.
+	//
+	// It exists because the two are not interchangeable for anything that
+	// GIVES rights away. A default of allow is a reasonable thing to fall back
+	// on; a default that elevates would mean every unmatched application runs
+	// as administrator. Callers that hand out privilege check this.
+	FromRule bool
+}
+
+// Elevates reports whether this decision grants administrator rights.
+//
+// A method rather than a comparison at each call site, because the condition
+// is not just "the action is elevate": it must also have come from a rule. The
+// backend already refuses to store a default action of elevate, and this is
+// the second lock on the same door — the one that holds even if a policy
+// arrives from an older backend, a hand-edited document, or a future bug.
+func (d Decision) Elevates() bool {
+	return d.Action == ActionElevate && d.FromRule
 }
 
 // Evaluate returns what the policy says about one program.
@@ -145,24 +165,78 @@ type Decision struct {
 func (e *Effective) Evaluate(p Program) Decision {
 	enforced := e.Mode == ModeEnforce
 
-	for _, er := range e.Rules {
+	for i, er := range e.Rules {
 		if !er.Rule.Enabled || !matches(er.Rule.Match, p) {
 			continue
 		}
 		action := er.Rule.Action
+		fromRule := true
 		if action == ActionDefault {
+			// The rule is a carve-out: it says "stop looking, use the
+			// default". The DEFAULT decided, not the rule, so anything gated
+			// on a rule having decided must not fire.
 			action = e.defaultAction()
+			fromRule = false
 		}
+
+		// One exception to first-match-wins, and only one: a block anywhere
+		// below beats an elevate.
+		//
+		// elevate.go states this as a safety rule — "a block always beats an
+		// elevate for the same application; refusing to run something is a
+		// safe mistake, running it as administrator is not" — and until now
+		// nothing implemented it. Ordering an elevate rule above a block rule
+		// did not merely elevate instead of blocking: no platform implements
+		// elevation, so the elevate did nothing, the block never ran, and the
+		// application the operator had forbidden simply started. One rule
+		// silently disabling another is the worst shape a policy engine has,
+		// because the editor shows both as enabled.
+		//
+		// Scoped to elevate deliberately. An allow above a block is an
+		// operator saying "this one is fine", which is what rule order is
+		// for, and overriding that would make the editor's order a lie in the
+		// other direction.
+		if action == ActionElevate && fromRule {
+			if blocked, ok := e.laterBlock(p, i); ok {
+				return blocked
+			}
+		}
+
 		return Decision{
 			Action: action, Rule: er.Rule.Name,
 			PolicyName: er.PolicyName, Enforced: enforced,
 			// Removal is a property of the rule that matched, and only
 			// meaningful for a block.
-			Remove: er.RemoveBlocked && action == ActionBlock,
+			Remove:   er.RemoveBlocked && action == ActionBlock && fromRule,
+			FromRule: fromRule,
 		}
 	}
 
 	return Decision{Action: e.defaultAction(), Enforced: enforced}
+}
+
+// laterBlock looks past an elevate rule for a block rule that also matches.
+//
+// Only called for an elevate, so the ordinary path stays a single pass and
+// first-match-wins everywhere else.
+// Indexed rather than compared by value: EffectiveRule carries match criteria
+// holding slices, so == does not compile on it and comparing by name would
+// pick the wrong rule whenever two share one — which preparePolicy permits.
+func (e *Effective) laterBlock(p Program, from int) (Decision, bool) {
+	// Strictly after the rule that matched. A block ABOVE the elevate is left
+	// alone: it would already have won on its own.
+	for _, er := range e.Rules[from+1:] {
+		if !er.Rule.Enabled || er.Rule.Action != ActionBlock || !matches(er.Rule.Match, p) {
+			continue
+		}
+		return Decision{
+			Action: ActionBlock, Rule: er.Rule.Name,
+			PolicyName: er.PolicyName, Enforced: e.Mode == ModeEnforce,
+			Remove:   er.RemoveBlocked,
+			FromRule: true,
+		}, true
+	}
+	return Decision{}, false
 }
 
 func (e *Effective) defaultAction() string {

@@ -112,6 +112,21 @@ type Agent struct {
 	// program can remove. One asker, many readers.
 	permOK   atomic.Bool
 	permNote atomic.Pointer[string]
+
+	// connectedSince is when the CURRENT connection was made.
+	//
+	// Set on the transition into connected and cleared on the way out, rather
+	// than refreshed alongside the status file — which is rewritten every few
+	// seconds and would make every reader say "connected for 5 seconds"
+	// for ever.
+	connectedSince atomic.Pointer[time.Time]
+
+	// policySyncedAt is when application policy last arrived, and what it
+	// contained. Published so the menu bar can answer "is this machine up to
+	// date" without the user opening a portal.
+	policySyncedAt atomic.Pointer[time.Time]
+	policyRules    atomic.Int64
+	policyMode     atomic.Pointer[string]
 }
 
 // New creates a new agent
@@ -202,6 +217,29 @@ func (a *Agent) publishStatus(connected bool, lastErr string) {
 	if note := a.permNote.Load(); note != nil {
 		st.PermissionNote = *note
 	}
+
+	// The connection clock starts on the transition, not on every publish.
+	// publishStatus runs on a heartbeat as well as on change, so stamping it
+	// here unconditionally would reset the answer every few seconds.
+	switch {
+	case connected && !a.connected.Load():
+		now := time.Now()
+		a.connectedSince.Store(&now)
+	case !connected:
+		a.connectedSince.Store(nil)
+	}
+	if since := a.connectedSince.Load(); since != nil {
+		st.ConnectedSince = *since
+	}
+
+	if at := a.policySyncedAt.Load(); at != nil {
+		st.PolicySyncedAt = *at
+	}
+	st.PolicyRules = int(a.policyRules.Load())
+	if mode := a.policyMode.Load(); mode != nil {
+		st.PolicyMode = *mode
+	}
+
 	a.connected.Store(connected)
 
 	if err := agentstatus.Write(st); err != nil {
@@ -294,6 +332,12 @@ func (a *Agent) Start(ctx context.Context) error {
 	// (InsecureSkipVerify) so it works even when the pinned CA is stale, and checks
 	// immediately on startup to catch any CA rotation that happened while offline.
 	go a.caFingerprintLoop(ctx)
+
+	// Watches for the menu bar's "Sync Now". Started here with the other
+	// background loops so it runs whether or not application control is
+	// enabled — the button has to answer either way, even if the answer is
+	// that nothing changed.
+	go a.syncRequestLoop(ctx)
 
 	// tunnelOnce ensures the tunnel goroutine is started only once,
 	// after agentID is known from the first successful registration.
@@ -1494,10 +1538,27 @@ func (a *Agent) handleSelfUpdate(downloadURL string) {
 	if resolved, rerr := filepath.EvalSymlinks(currentBin); rerr == nil {
 		currentBin = resolved
 	}
-	binDir := filepath.Dir(currentBin)
+
+	// Extraction goes to a TEMPORARY directory, never beside the running
+	// binary.
+	//
+	// It used to use the running binary's own directory, which was harmless
+	// while that was /usr/local/bin. It stopped being harmless when the macOS
+	// daemon moved inside the application bundle: extracting there writes into
+	// a code-signed bundle, breaks its seal, and macOS then tells the user
+	// their security agent "is damaged and can't be opened".
+	workDir, err := os.MkdirTemp("", "wxt-agent-update-work-")
+	if err != nil {
+		a.sendUpdateStatus("update_error", "create work directory: "+err.Error())
+		return
+	}
+	defer a.removeQuiet(workDir)
+	binDir := workDir
 
 	// 2. Download the package to a temp file.
-	tmpPkg, err := os.CreateTemp("", "wxt-agent-update-*")
+	// Named after what is being fetched: the extractor opens a package by its
+	// extension, and a temp file without one is a package it cannot read.
+	tmpPkg, err := os.CreateTemp("", updateTempPattern(downloadURL))
 	if err != nil {
 		a.sendUpdateStatus("update_error", "create temp file: "+err.Error())
 		return
@@ -1532,6 +1593,35 @@ func (a *Agent) handleSelfUpdate(downloadURL string) {
 	if err := os.Chmod(newBin, 0o755); err != nil { // #nosec G302
 		a.logger.Warn("Self-update: failed to chmod new binary", zap.Error(err))
 	}
+	// On macOS the unit of update is the application BUNDLE, not a loose
+	// binary, and the bundle is what launchd actually starts. Replacing the
+	// binary inside it would break its signature; replacing only
+	// /usr/local/bin would leave launchd running the old agent for ever,
+	// reporting a successful update that changed nothing.
+	if done, err := a.swapMacOSBundle(tmpPkgPath, workDir); done {
+		if err != nil {
+			a.logger.Error("Self-update: could not replace the application bundle", zap.Error(err))
+			a.sendUpdateStatus("update_error", "bundle replace failed: "+err.Error())
+			return
+		}
+		a.logger.Info("Self-update: application bundle replaced, restarting service")
+		a.sendUpdateStatus("update_complete", "agent updated — restarting service")
+		time.Sleep(500 * time.Millisecond)
+		a.restartService()
+		return
+	}
+
+	if insideAppBundlePath(currentBin) {
+		// Belt and braces: whatever happens above, never write into a signed
+		// bundle. Better a failed update that says so than an application the
+		// operating system calls damaged.
+		a.logger.Error("Self-update: refusing to overwrite a binary inside the application bundle",
+			zap.String("bin", currentBin))
+		a.sendUpdateStatus("update_error",
+			"the agent runs from inside wxt-agent.app and the update package carries no bundle to replace it with")
+		return
+	}
+
 	if err := os.Rename(newBin, currentBin); err != nil {
 		// Cross-device rename or permission denied → fall back to a sudo copy.
 		// newBin/currentBin are agent-internal paths (temp extract dir / our own

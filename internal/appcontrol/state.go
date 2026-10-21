@@ -42,6 +42,13 @@ type lockRecord struct {
 	// getting it wrong means either an application left missing or an
 	// execute bit restored on something that is not there.
 	Quarantined bool `json:"quarantined,omitempty"`
+
+	// Elevated marks a grant of administrator rights rather than a removal of
+	// them. It shares this record, and therefore this restore discipline, for
+	// one reason: a grant left behind after the policy stopped asking for it
+	// is a permanent hole, and the only machinery that reliably withdraws
+	// things here is the one that already withdraws locks.
+	Elevated bool `json:"elevated,omitempty"`
 }
 
 type lockState struct {

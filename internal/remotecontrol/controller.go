@@ -161,9 +161,36 @@ func EnsureHelper(dir string) (string, error) {
 	// feature speaking different versions of the IPC protocol, with nothing to
 	// suggest an upgrade had only half happened. Extract is a no-op when the
 	// bytes already match, so this costs nothing in the normal case.
-	if helperbin.Available() {
+	// An application bundle is READ ONLY, whatever is embedded here.
+	//
+	// Writing a single byte inside a signed .app breaks its seal, and macOS
+	// then refuses to open it with "the application is damaged and can't be
+	// opened. You should move it to the Trash." The user is told their
+	// security agent is damaged, by the operating system, and offered the bin.
+	//
+	// It took exactly one condition to get there: the helper the bundle ships
+	// and the helper the agent carries embedded are both correct and both
+	// signed, but codesign is not deterministic — the same input signed twice
+	// produces different bytes — so the byte comparison below always said
+	// "different" and always rewrote the bundle copy on the first session.
+	//
+	// The bundle's own copy is the right one anyway: an upgrade replaces the
+	// whole bundle, so what is in there matches the agent that shipped with
+	// it. Pairing with a slightly older helper, in the case where it does not,
+	// is a version mismatch the IPC handshake already reports. A destroyed
+	// application is not recoverable by anything.
+	if insideAppBundle(dir) {
+		if existing, err := FindHelper(dir); err == nil {
+			return existing, nil
+		}
+		// No helper in the bundle: fall through and install one somewhere
+		// writable rather than refusing to work at all.
+		dir = writableHelperDir()
+	}
+
+	if helperAvailable() {
 		path := filepath.Join(dir, CanonicalHelperName())
-		if _, err := helperbin.Extract(path); err != nil {
+		if _, err := helperExtract(path); err != nil {
 			// Fall back to whatever is on disk: an older helper that works is
 			// better than no session at all.
 			if existing, ferr := FindHelper(dir); ferr == nil {
@@ -582,3 +609,52 @@ func (c *Controller) reportPermissions(ok bool, note string) {
 		(*fn)(ok, note)
 	}
 }
+
+// insideAppBundle reports whether a path sits within a macOS .app.
+//
+// Used to keep the agent from writing where a code signature has sealed
+// everything: anything under Contents/ is covered by the bundle's seal, so a
+// write there is the difference between a working product and an application
+// the operating system calls damaged.
+func insideAppBundle(path string) bool {
+	for dir := filepath.Clean(path); dir != "/" && dir != "." && dir != ""; dir = filepath.Dir(dir) {
+		if strings.EqualFold(filepath.Ext(dir), ".app") {
+			return true
+		}
+	}
+	return false
+}
+
+// writableHelperDir is somewhere the agent may install a helper.
+//
+// The agent's own directory, which is /usr/local/bin for a normal install —
+// never inside the application bundle.
+func writableHelperDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	dir := filepath.Dir(exe)
+	if insideAppBundle(dir) {
+		// The agent itself now runs from inside the bundle, so its own
+		// directory is no help. Fall back to the install directory the
+		// installers use.
+		return fallbackHelperDir
+	}
+	return dir
+}
+
+// helperAvailable and helperExtract are indirected so a test can stand in an
+// embedded helper.
+//
+// Without a seam here the one behaviour that matters most — that the agent
+// never writes inside a signed application bundle — is untestable: a test
+// binary carries no embedded helper, so the extract path is never reached and
+// a test passes whether or not the guard exists. That is exactly what happened,
+// and the bug it hid told users their security agent was damaged.
+//
+// The same shape as ipc.Host's launch field, for the same reason.
+var (
+	helperAvailable = helperbin.Available
+	helperExtract   = helperbin.Extract
+)

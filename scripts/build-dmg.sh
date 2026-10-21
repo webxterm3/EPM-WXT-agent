@@ -219,6 +219,26 @@ create_dmg() {
         fi
     fi
 
+    # Notarisation is the difference between a disk image somebody can
+    # double-click and one macOS calls "damaged".
+    #
+    # A valid signature is NOT enough. Gatekeeper asks Apple whether it has
+    # seen this build, and for anything a browser downloaded it refuses when
+    # the answer is no — wording it as "is damaged and can't be opened. You
+    # should move it to the Bin", which reads as a corrupt file rather than a
+    # policy decision, and withholding the app's icon on top. That has cost
+    # real debugging time, so the build says it out loud rather than letting
+    # it be discovered by whoever downloads the result.
+    if command -v stapler >/dev/null 2>&1 && stapler validate "$APP" >/dev/null 2>&1; then
+        echo "  ✓ notarised — browser downloads will open normally"
+    else
+        echo -e "${YELLOW}  Not notarised: macOS will call this \"damaged\" if a BROWSER downloads it.${NC}"
+        echo "      The terminal install (install-macos.sh) is unaffected and is what"
+        echo "      the portal leads with. Disk-image users need this once:"
+        echo "        xattr -dr com.apple.quarantine /Applications/wxt-agent.app"
+        echo "      An Apple Developer ID + notarytool removes the need for both."
+    fi
+
     # The /Applications link is what makes this read as an ordinary Mac
     # install: drag across, done.
     ln -s /Applications "$STAGE/Applications"
@@ -226,27 +246,57 @@ create_dmg() {
     cat > "$STAGE/README.txt" << README
 wxt-agent ${VERSION} (macOS ${ARCH})
 
-INSTALL
+IF macOS CALLS THIS APP "DAMAGED"
+It is not damaged, and there is nothing wrong with this download.
+
+This build is signed with Coredge's own certificate rather than an Apple
+Developer ID, and it is not notarised by Apple. Gatekeeper will not vouch for
+software it cannot trace back to Apple, and "damaged ... move it to the Bin"
+is simply the wording it uses when it declines. Finder leaves the app showing
+a blank icon instead of the product logo for the same reason.
+
+Gatekeeper only acts on files a BROWSER downloaded - it looks for a mark
+called com.apple.quarantine. Installing from a terminal never sets that mark,
+so the one-line install below never meets Gatekeeper at all. That is the
+recommended route, and it needs no workaround.
+
+INSTALL - recommended
+  Copy the one-line install command from the EPM portal:
+  Machines > Add Machine. It downloads, installs and enrols in one step.
+
+INSTALL - from this disk image
   1. Drag wxt-agent onto the Applications folder.
-  2. Open it.
-  3. Paste the enrolment command from the EPM portal, then authenticate.
+  2. In Terminal, clear the browser's download mark:
+
+         xattr -dr com.apple.quarantine /Applications/wxt-agent.app
+
+  3. Open wxt-agent.
+  4. Paste the enrolment command from the EPM portal, then authenticate.
+
+  Step 2 is not optional on this build - skipping it is what produces the
+  "damaged" message. It disables nothing: it removes the mark saying this
+  file arrived from a browser. Gatekeeper still guards everything else.
 
 AFTERWARDS
   Opening wxt-agent again shows its status, checks its permissions, or removes it.
 
 PERMISSIONS
-Remote control needs two macOS permissions. Once the agent has run, both
-wxt-agent entries are LISTED for you in:
+Remote control needs two macOS permissions. One wxt-agent entry is listed for
+you in each of:
 
     System Settings > Privacy & Security > Accessibility
     System Settings > Privacy & Security > Screen Recording
 
-Switch each one on. You do not need to add any files by hand.
+Switch both on. You do not need to add any files by hand, and there is only
+one entry per pane to find - it covers the whole product.
 
-If you are upgrading and an entry is already switched on, remove it with the
-minus button and add it again. macOS ties the grant to the exact build it was
-given, so an entry left over from an older build stays on while granting
-nothing.
+These grants survive an upgrade. They are recorded against this product's
+signing certificate, not against one particular build, so do not remove and
+re-add an entry after updating. If a switch is on and remote control still
+does not work, that is a grant left over from a build signed differently;
+clear it deliberately with:
+
+    sudo wxt-agent repair-permissions
 
 ACCOUNTS
 This agent does not create user accounts. It works with the accounts already on

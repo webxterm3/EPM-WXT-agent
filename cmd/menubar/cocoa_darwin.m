@@ -32,12 +32,14 @@
 - (void)status:(id)sender      { wxtMenuStatus(); }
 - (void)uninstall:(id)sender   { wxtMenuUninstall(); }
 - (void)quit:(id)sender        { wxtMenuQuit(); }
+- (void)sync:(id)sender        { wxtMenuSync(); }
 - (void)tick:(NSTimer *)t      { wxtRefresh(); }
 @end
 
 static WxtMenuDelegate *g_delegate = nil;
 static NSMenuItem *g_titleItem = nil;
 static NSMenuItem *g_detailItem = nil;
+static NSMenuItem *g_syncItem = nil;
 
 // wxt_icon draws the shield, with a tick or a cross badge.
 static NSImage *wxt_icon(int connected) {
@@ -92,12 +94,64 @@ static NSImage *wxt_icon(int connected) {
 	return out;
 }
 
-void wxt_set_state(int connected, const char *title, const char *detail) {
+// wxt_readout styles a row that reports rather than offers.
+//
+// These rows used to be `enabled = NO`, which is how AppKit is normally told
+// "not for picking" — but it also greys the text out, and grey in a menu reads
+// as "unavailable". The first thing anybody opens this menu for is to see
+// whether the agent is connected, and the answer was rendered in the colour
+// the system uses for things that are not working.
+//
+// So the menu turns off automatic enabling (wxt_run sets autoenablesItems =
+// NO), the rows stay enabled, and they simply carry no action. They draw in
+// the ordinary label colour and clicking one does nothing.
+static NSAttributedString *wxt_readout(NSString *text, NSColor *dotColour) {
+	NSMutableAttributedString *out = [[NSMutableAttributedString alloc] init];
+	NSFont *font = [NSFont menuFontOfSize:0];
+
+	if (dotColour) {
+		[out appendAttributedString:[[NSAttributedString alloc]
+			initWithString:@"\u25CF  "
+			attributes:@{ NSForegroundColorAttributeName: dotColour,
+			              NSFontAttributeName: font }]];
+	}
+	[out appendAttributedString:[[NSAttributedString alloc]
+		initWithString:text
+		attributes:@{ NSForegroundColorAttributeName: [NSColor labelColor],
+		              NSFontAttributeName: font }]];
+	return out;
+}
+
+// wxt_secondary styles a supporting row — the machine and server, the last
+// sync. Dimmer than the headline but still not the disabled grey, because it
+// is information rather than an unavailable choice.
+static NSAttributedString *wxt_secondary(NSString *text) {
+	return [[NSAttributedString alloc]
+		initWithString:text
+		attributes:@{ NSForegroundColorAttributeName: [NSColor secondaryLabelColor],
+		              NSFontAttributeName: [NSFont menuFontOfSize:
+		                  [NSFont smallSystemFontSize]] }];
+}
+
+void wxt_set_state(int connected, const char *title, const char *detail, const char *sync) {
 	if (!g_delegate) return;
+
 	g_delegate.item.button.image = wxt_icon(connected);
 	g_delegate.item.button.toolTip = [NSString stringWithUTF8String:title];
-	g_titleItem.title = [NSString stringWithUTF8String:title];
-	g_detailItem.title = [NSString stringWithUTF8String:detail];
+
+	// The dot is the fastest thing to read in the whole menu, and it says the
+	// one thing the menu exists for. Green and red rather than the tick and
+	// cross on the icon, because those are 18 points in the menu bar and this
+	// is not.
+	NSColor *dot = connected ? [NSColor systemGreenColor] : [NSColor systemRedColor];
+	g_titleItem.attributedTitle =
+		wxt_readout([NSString stringWithUTF8String:title], dot);
+
+	g_detailItem.attributedTitle =
+		wxt_secondary([NSString stringWithUTF8String:detail]);
+
+	g_syncItem.attributedTitle =
+		wxt_secondary([NSString stringWithUTF8String:sync]);
 }
 
 void wxt_run(double pollSeconds) {
@@ -112,37 +166,59 @@ void wxt_run(double pollSeconds) {
 
 		NSMenu *menu = [[NSMenu alloc] init];
 
-		// The first two rows are the answer to "is it working?", which is why
-		// somebody clicks this at all. Disabled because they are a readout,
-		// not something to pick.
+		// AppKit's automatic enabling greys out anything with no action, and
+		// grey reads as "not working" — which is the opposite of what the
+		// top row says when the agent is connected. Turned off so the readout
+		// rows can stay in their normal colour while still doing nothing when
+		// clicked.
+		menu.autoenablesItems = NO;
+
+		// The first rows are the answer to "is it working?", which is why
+		// somebody opens this at all. They report; they are not choices.
 		g_titleItem = [[NSMenuItem alloc] initWithTitle:@"wxt-agent" action:nil keyEquivalent:@""];
-		g_titleItem.enabled = NO;
+		g_titleItem.enabled = YES;
 		[menu addItem:g_titleItem];
 
 		g_detailItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
-		g_detailItem.enabled = NO;
+		g_detailItem.enabled = YES;
 		[menu addItem:g_detailItem];
+
+		g_syncItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+		g_syncItem.enabled = YES;
+		[menu addItem:g_syncItem];
+
+		// Asks the agent to fetch policy now. The agent is a root daemon with
+		// the connection; this writes a request it picks up within a second.
+		NSMenuItem *sync = [[NSMenuItem alloc] initWithTitle:@"Sync Now"
+			action:@selector(sync:) keyEquivalent:@""];
+		sync.target = g_delegate;
+		sync.enabled = YES;
+		[menu addItem:sync];
 
 		[menu addItem:[NSMenuItem separatorItem]];
 
 		NSMenuItem *st = [[NSMenuItem alloc] initWithTitle:@"Agent Status…"
 			action:@selector(status:) keyEquivalent:@""];
 		st.target = g_delegate;
+		st.enabled = YES;
 		[menu addItem:st];
 
 		NSMenuItem *pm = [[NSMenuItem alloc] initWithTitle:@"Check Permissions…"
 			action:@selector(permissions:) keyEquivalent:@""];
 		pm.target = g_delegate;
+		pm.enabled = YES;
 		[menu addItem:pm];
 
 		NSMenuItem *lg = [[NSMenuItem alloc] initWithTitle:@"View Logs"
 			action:@selector(logs:) keyEquivalent:@""];
 		lg.target = g_delegate;
+		lg.enabled = YES;
 		[menu addItem:lg];
 
 		NSMenuItem *un = [[NSMenuItem alloc] initWithTitle:@"Uninstall wxt-agent…"
 			action:@selector(uninstall:) keyEquivalent:@""];
 		un.target = g_delegate;
+		un.enabled = YES;
 		[menu addItem:un];
 
 		[menu addItem:[NSMenuItem separatorItem]];
@@ -154,6 +230,7 @@ void wxt_run(double pollSeconds) {
 		NSMenuItem *q = [[NSMenuItem alloc] initWithTitle:@"Hide Menu Bar Icon"
 			action:@selector(quit:) keyEquivalent:@""];
 		q.target = g_delegate;
+		q.enabled = YES;
 		[menu addItem:q];
 
 		g_delegate.item.menu = menu;

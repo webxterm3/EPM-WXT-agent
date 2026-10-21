@@ -27,22 +27,27 @@ func wxtMenuUninstall() { uninstallAgent() }
 //export wxtMenuQuit
 func wxtMenuQuit() { C.wxt_stop() }
 
+//export wxtMenuSync
+func wxtMenuSync() { requestSync() }
+
 //export wxtRefresh
 func wxtRefresh() {
-	connected, title, detail := currentState()
+	connected, title, detail, sync := currentState()
 
 	cTitle := C.CString(title)
 	cDetail := C.CString(detail)
+	cSync := C.CString(sync)
 	defer func() {
 		C.free(unsafe.Pointer(cTitle))
 		C.free(unsafe.Pointer(cDetail))
+		C.free(unsafe.Pointer(cSync))
 	}()
 
 	flag := C.int(0)
 	if connected {
 		flag = 1
 	}
-	C.wxt_set_state(flag, cTitle, cDetail)
+	C.wxt_set_state(flag, cTitle, cDetail, cSync)
 }
 
 // showText displays a read-only, selectable block of text.

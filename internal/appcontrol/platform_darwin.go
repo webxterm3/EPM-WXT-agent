@@ -245,3 +245,24 @@ func installWatchDirs() []string {
 	}
 	return dirs
 }
+
+// platformElevator is not implemented yet on macOS.
+//
+// The mechanism is not the hard part — the agent is a root LaunchDaemon and
+// `launchctl asuser` adopts the target user's session WITHOUT dropping
+// privileges, so a process started that way already runs as root in their
+// GUI session. What is missing is interception: macOS offers no supported way
+// to catch a launch and redirect it without an Endpoint Security entitlement
+// this product does not hold, so "the user double-clicks and it comes up
+// elevated" cannot be delivered the way it can on Windows.
+//
+// It reports unsupported rather than quietly doing nothing, so a rule asking
+// for elevation shows up in the portal as a rule this platform cannot honour.
+// That is the whole lesson of the publisher bug and the elevate no-op: a
+// feature that silently does nothing is indistinguishable from a broken one.
+func platformElevator(*zap.Logger) Elevator {
+	return unsupportedElevator{
+		reason: "macOS cannot intercept a launch without the Endpoint Security entitlement; " +
+			"elevation is not available on this platform yet",
+	}
+}

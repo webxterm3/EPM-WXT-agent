@@ -754,7 +754,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if logFilePath == "" {
 		logFilePath = defaultLogFile()
 	}
-	logSinks := []zapcore.WriteSyncer{zapcore.AddSync(os.Stdout)}
+	// stdout is a sink only when it is somewhere else.
+	//
+	// Under launchd the daemon's StandardOutPath was this same file, so every
+	// line was written once by the file sink below and once more by launchd
+	// capturing stdout — a log where everything appeared twice, which reads
+	// as the agent doing everything twice. Dropping the sink here repairs
+	// machines already carrying that plist, without anyone re-enrolling them.
+	var logSinks []zapcore.WriteSyncer
+	if !stdoutGoesTo(logFilePath) {
+		logSinks = append(logSinks, zapcore.AddSync(os.Stdout))
+	}
 	if logFilePath != "" {
 		// logFilePath is this agent's own config value (cfg.Logging.File) or the
 		// platform default, never request/user input. Left world-readable

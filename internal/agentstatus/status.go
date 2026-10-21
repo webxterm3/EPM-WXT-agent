@@ -37,6 +37,28 @@ type Status struct {
 	// without a timestamp and mean very different things.
 	UpdatedAt time.Time `json:"updated_at"`
 
+	// ConnectedSince is when the CURRENT connection was established.
+	//
+	// Not when the agent started, and not the last time it refreshed this
+	// file: a reader showing "connected for 3 days" when the stream dropped
+	// and re-established four times overnight reports the opposite of what
+	// somebody asking that question wants to know. Zero while disconnected,
+	// and reset every time a connection is made.
+	ConnectedSince time.Time `json:"connected_since,omitempty"`
+
+	// PolicySyncedAt is when application policy last arrived from the portal.
+	//
+	// Separate from UpdatedAt because they answer different questions. This
+	// file is rewritten every few seconds; policy arrives when somebody saves
+	// one, which may be days apart. "Last synced a few seconds ago" on a
+	// machine whose policy is a week old would be a lie by omission.
+	PolicySyncedAt time.Time `json:"policy_synced_at,omitempty"`
+
+	// PolicyRules and PolicyMode describe the policy currently held, so a
+	// reader can say what arrived rather than only when.
+	PolicyRules int    `json:"policy_rules,omitempty"`
+	PolicyMode  string `json:"policy_mode,omitempty"`
+
 	// LastError is the most recent reason the agent could not connect, if any.
 	LastError string `json:"last_error,omitempty"`
 

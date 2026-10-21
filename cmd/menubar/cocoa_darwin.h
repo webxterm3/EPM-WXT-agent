@@ -2,7 +2,7 @@
 #ifndef WXT_COCOA_DARWIN_H
 #define WXT_COCOA_DARWIN_H
 
-void wxt_set_state(int connected, const char *title, const char *detail);
+void wxt_set_state(int connected, const char *title, const char *detail, const char *sync);
 void wxt_run(double pollSeconds);
 void wxt_show_text(const char *title, const char *body);
 void wxt_stop(void);

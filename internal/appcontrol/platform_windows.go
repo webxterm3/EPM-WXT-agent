@@ -276,3 +276,18 @@ func installWatchDirs() []string {
 	}
 	return dirs
 }
+
+// platformElevator is not implemented yet on Windows.
+//
+// The pieces exist — Image File Execution Options can redirect a launch (it is
+// already used here to block one), and the agent runs as SYSTEM with the token
+// machinery to start a process in the user's session. What is missing is the
+// broker that sits between them, and it is the part worth being slow about:
+// anything that turns a user's launch into an administrator's process is, by
+// construction, a privilege-escalation primitive, and one that can be tricked
+// hands every local user on the machine administrator rights.
+func platformElevator(*zap.Logger) Elevator {
+	return unsupportedElevator{
+		reason: "the Windows elevation broker is not built yet",
+	}
+}

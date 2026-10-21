@@ -544,9 +544,25 @@ deploy-binaries: packages-desktop ## Build macOS + Windows packages and copy to 
 	@echo "macOS standalone agent binaries (for curl installs)..."
 	@f=$(BIN_DIR)/darwin-amd64/wxt-agent; [ -f "$$f" ] && cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-macos-amd64 && echo "  ✓ wxt-agent-macos-amd64" || echo "  ✗ wxt-agent-macos-amd64 not found"
 	@f=$(BIN_DIR)/darwin-arm64/wxt-agent; [ -f "$$f" ] && cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-macos-arm64 && echo "  ✓ wxt-agent-macos-arm64" || echo "  ✗ wxt-agent-macos-arm64 not found"
+	@# The version these packages carry, recorded beside them.
+	@#
+	@# The backend offers an update whenever a machine's version differs from
+	@# "latest", and "latest" used to be typed by hand into LATEST_AGENT_VERSION.
+	@# The two drifted — the backend advertised 1.2.1-rc3 while these files were
+	@# 1.0.0-rc3 — and the result was not a wrong label: every agent updated,
+	@# reported the version it had really installed, still did not match, and was
+	@# offered the same update again for ever. Writing it here makes the packages
+	@# and the claim about them one act.
+	@printf '%s' "$(VERSION)" > $(AGENT_BACKEND_DIR)/agent-binaries/VERSION && echo "  ✓ VERSION ($(VERSION))"
 	@echo ""
 	@echo "✓ Deploy complete!"
 	@ls -lh $(AGENT_BACKEND_DIR)/agent-binaries/ | grep -v gitkeep
+	@case "$(VERSION)" in \
+	  *dirty*|*-g*|"") echo ""; \
+	    echo "  Warning: deployed as \"$(VERSION)\" — a development build string."; \
+	    echo "  Agents will report this to the portal. Deploy a release with:"; \
+	    echo "      make deploy-binaries VERSION=1.0.0-rc4" ;; \
+	esac
 
 release: clean packages ## Build release packages
 	@echo ""

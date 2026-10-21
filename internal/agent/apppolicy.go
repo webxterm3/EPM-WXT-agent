@@ -1,13 +1,16 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/Yesveer/wxt-agent/internal/agentstatus"
 	"github.com/Yesveer/wxt-agent/internal/apppolicy"
 )
 
@@ -122,6 +125,18 @@ func (a *Agent) handleAppPolicy(payload string) {
 	}
 
 	eff := a.policies.Current()
+
+	// Stamped here, where policy actually arrived — not on the heartbeat that
+	// rewrites the status file every few seconds. "Last synced" has to mean
+	// the last time a policy came down, or it answers a different question
+	// to the one the menu bar asks.
+	now := time.Now()
+	a.policySyncedAt.Store(&now)
+	a.policyRules.Store(int64(len(eff.Rules)))
+	mode := eff.Mode
+	a.policyMode.Store(&mode)
+	a.publishStatus(a.connected.Load(), "")
+
 	a.logger.Info("App policy: updated",
 		zap.String("mode", eff.Mode),
 		zap.String("default_action", eff.DefaultAction),
@@ -137,4 +152,78 @@ func (a *Agent) handleAppPolicy(payload string) {
 	if a.appControl != nil {
 		a.appControl.Kick()
 	}
+}
+
+// PolicyRequestDiscriminator asks the backend to push this machine's policy.
+//
+// Agent-to-server, which is the safe direction. The reverse — a new
+// server-to-agent command id — is not safe in this product: handleCommand
+// matches a fixed list and then falls through to running the payload through a
+// shell, so any agent predating a new id would EXECUTE what was sent to it.
+// The backend ignores discriminators it does not know, so an old backend
+// simply does nothing with this.
+const PolicyRequestDiscriminator = "__policy_request__"
+
+// syncRequestPoll is how often a pressed button is noticed.
+//
+// A stat of one local file, so the cost is nothing and the only consideration
+// is how long somebody stares at a menu before deciding it did not work. The
+// status heartbeat would have done the job at fifteen seconds and felt broken.
+const syncRequestPoll = time.Second
+
+// syncRequestLoop watches for the menu bar's "sync now" and asks the backend
+// for a fresh policy.
+//
+// The request carries nothing but the agent's identity. What a sync means, and
+// whether this machine may have one, is decided entirely by the backend — so a
+// user who can write the request file gains nothing they could not have by
+// waiting for the next push.
+func (a *Agent) syncRequestLoop(ctx context.Context) {
+	ticker := time.NewTicker(syncRequestPoll)
+	defer ticker.Stop()
+
+	// The agent creates the file the menu bar writes into, because the menu
+	// bar cannot: /var/log/vsay belongs to root so the agent's own log is not
+	// writable by every user on the machine, and creating a file there needs
+	// permission on the directory. Writing INTO an existing file does not.
+	//
+	// This also drops anything left from a previous run. A press that went
+	// unanswered because the agent was stopping should not fire on the next
+	// start, long after whoever pressed it stopped caring.
+	if err := agentstatus.PrepareSyncRequest(); err != nil {
+		// Said once, at Warn: the button will fail for everyone on this
+		// machine and the menu bar can only report what it sees from the
+		// other side.
+		a.logger.Warn("Could not prepare the sync-request file — the menu bar's "+
+			"Sync Now will not work on this machine", zap.Error(err))
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			agentstatus.ClearSyncRequest()
+			return
+		case <-ticker.C:
+			if !agentstatus.TakeSyncRequest() {
+				continue
+			}
+			a.requestPolicyPush()
+		}
+	}
+}
+
+// requestPolicyPush asks the backend to send this machine's policy now.
+func (a *Agent) requestPolicyPush() {
+	client := a.grpcSafe()
+	if client == nil {
+		// Offline. Saying so in the log matters because the menu bar cannot:
+		// it reads a file and has no idea whether the request was answered.
+		a.logger.Info("App policy: a sync was requested but the agent is not connected")
+		return
+	}
+	if err := client.SendStatusUpdate(PolicyRequestDiscriminator, "{}"); err != nil {
+		a.logger.Warn("App policy: could not ask for a sync", zap.Error(err))
+		return
+	}
+	a.logger.Info("App policy: sync requested")
 }

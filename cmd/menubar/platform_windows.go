@@ -73,11 +73,19 @@ const (
 	mfString       = 0x0000
 	mfSeparator    = 0x0800
 	mfGrayed       = 0x0001
-	timerID        = 1
-	mbOK           = 0x0000
-	mbYesNo        = 0x0004
-	mbIconInfo     = 0x0040
-	mbIconWarning  = 0x0030
+	// mfDisabled makes an item unselectable WITHOUT greying it.
+	//
+	// The readout rows used mfGrayed, which is how Win32 is normally told
+	// "not for picking" — and it also draws the text in the disabled colour.
+	// Grey reads as "not working", which is the opposite of what the top row
+	// says when the agent is connected, and that row is the first thing
+	// anybody opens this menu to see.
+	mfDisabled    = 0x0002
+	timerID       = 1
+	mbOK          = 0x0000
+	mbYesNo       = 0x0004
+	mbIconInfo    = 0x0040
+	mbIconWarning = 0x0030
 	// What MessageBox returns for the Yes button.
 	idYes = 6
 )
@@ -91,6 +99,7 @@ const (
 	cmdLogs        = 3
 	cmdUninstall   = 4
 	cmdHide        = 5
+	cmdSync        = 6
 )
 
 type notifyIconData struct {
@@ -259,10 +268,13 @@ func copyTip(d *notifyIconData, s string) {
 // flicker on some Windows versions, and there is nothing to gain from
 // repainting an unchanged picture.
 func refresh() {
-	connected, title, detail := currentState()
+	connected, title, detail, sync := currentState()
 	tip := title
 	if detail != "" {
 		tip = title + "\n" + detail
+	}
+	if sync != "" {
+		tip = tip + "\n" + sync
 	}
 
 	if haveState && connected == lastState && tip == lastTip {
@@ -316,6 +328,8 @@ func wndProc(h windows.Handle, message uint32, wparam, lparam uintptr) uintptr {
 			openLogs()
 		case cmdUninstall:
 			go uninstallAgent()
+		case cmdSync:
+			requestSync()
 		case cmdHide:
 			procDestroyWindow.Call(uintptr(h))
 		}
@@ -338,10 +352,16 @@ func showMenu() {
 	}
 	defer procDestroyMenu.Call(menu)
 
-	// The first row is the answer to "is it working?", which is why somebody
-	// clicks this at all. Greyed because it is a readout, not a choice.
-	_, title, _ := currentState()
-	appendItem(menu, mfString|mfGrayed, 0, title)
+	// The first rows are the answer to "is it working?", which is why somebody
+	// clicks this at all. Disabled rather than greyed: they report, they are
+	// not choices, and the disabled colour would say the agent is unwell.
+	connected, title, detail, sync := currentState()
+	appendItem(menu, mfString|mfDisabled, 0, trayDot(connected)+title)
+	if detail != "" {
+		appendItem(menu, mfString|mfDisabled, 0, "    "+detail)
+	}
+	appendItem(menu, mfString|mfDisabled, 0, "    "+sync)
+	appendItem(menu, mfString, cmdSync, "Sync Now")
 	appendItem(menu, mfSeparator, 0, "")
 	appendItem(menu, mfString, cmdStatus, "Agent Status...")
 	appendItem(menu, mfString, cmdPermissions, "Check Permissions...")
@@ -481,4 +501,18 @@ func confirmUninstall() bool {
 		uintptr(unsafe.Pointer(b)), uintptr(unsafe.Pointer(t)),
 		mbYesNo|mbIconWarning)
 	return r == idYes
+}
+
+// trayDot prefixes the status row with a filled circle.
+//
+// A character rather than a colour, because a Win32 popup menu draws its text
+// in the system colour and will not take a per-item one without owner-draw —
+// which is a WM_MEASUREITEM/WM_DRAWITEM pair and a custom font metric, for one
+// dot. The macOS menu colours it green or red; here the shape carries it, and
+// the tray icon beside it is already the coloured signal.
+func trayDot(connected bool) string {
+	if connected {
+		return "●  " // filled circle: connected
+	}
+	return "○  " // hollow circle: not connected
 }

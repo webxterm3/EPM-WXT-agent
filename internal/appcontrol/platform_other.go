@@ -48,3 +48,8 @@ func applicationPathFor(exePath string) string { return exePath }
 
 // installWatchDirs is empty: application control targets Windows and macOS.
 func installWatchDirs() []string { return nil }
+
+// platformElevator: application control targets Windows and macOS.
+func platformElevator(*zap.Logger) Elevator {
+	return unsupportedElevator{reason: "application elevation is not implemented on this platform"}
+}

@@ -220,6 +220,7 @@ type Enforcer struct {
 	procs     ProcessLister
 	killer    Killer
 	locker    Locker
+	elevator  Elevator
 	collector appinventory.Collector
 	report    Reporter
 
@@ -254,6 +255,7 @@ type Options struct {
 	Procs     ProcessLister
 	Killer    Killer
 	Locker    Locker
+	Elevator  Elevator
 	Collector appinventory.Collector
 	Now       func() time.Time
 }
@@ -266,6 +268,7 @@ func New(opts Options) *Enforcer {
 		procs:     opts.Procs,
 		killer:    opts.Killer,
 		locker:    opts.Locker,
+		elevator:  opts.Elevator,
 		collector: opts.Collector,
 		report:    opts.Report,
 		now:       opts.Now,
@@ -290,6 +293,9 @@ func New(opts Options) *Enforcer {
 	}
 	if e.locker == nil {
 		e.locker = platformLocker(e.logger)
+	}
+	if e.elevator == nil {
+		e.elevator = platformElevator(e.logger)
 	}
 	if e.collector == nil {
 		e.collector = enforcementCollector()
@@ -491,6 +497,7 @@ func (e *Enforcer) Reconcile(ctx context.Context) {
 // them identically.
 func (e *Enforcer) decideLocks(pol *apppolicy.Effective, targets []Target) ([]lockRecord, bool) {
 	var out []lockRecord
+	var elevations []lockRecord
 	seen := make(map[string]bool, len(targets))
 
 	for _, t := range targets {
@@ -498,6 +505,23 @@ func (e *Enforcer) decideLocks(pol *apppolicy.Effective, targets []Target) ([]lo
 			continue
 		}
 		d := pol.Evaluate(t.program())
+
+		// Elevation is collected into the same list, so it inherits the one
+		// piece of machinery that reliably withdraws things: the held/wanted
+		// diff in applyLocks. A grant that outlives its policy is a hole
+		// nobody is watching.
+		if d.Elevates() {
+			elevations = append(elevations, lockRecord{
+				Key: t.key(), Name: t.Name, Path: t.Path,
+				ExePath: t.ExePath, BundleID: t.BundleID,
+				Publisher: t.Publisher,
+				Rule:      d.Rule, Policy: d.PolicyName,
+				Elevated: true,
+			})
+			seen[t.key()] = true
+			continue
+		}
+
 		if d.Action != apppolicy.ActionBlock {
 			continue
 		}
@@ -552,6 +576,30 @@ func (e *Enforcer) decideLocks(pol *apppolicy.Effective, targets []Target) ([]lo
 		}
 	}
 
+	// Elevation gets its own ceiling, far lower than the one for blocking.
+	//
+	// Fifty blocked applications is a plausible allow-list policy. Ten
+	// elevated ones is not a policy anybody writes on purpose — it is a rule
+	// that matched more than its author meant, and the result is a machine
+	// where most software runs as administrator. Checked FIRST, because if
+	// this trips, nothing else about the pass is worth applying either.
+	if len(elevations) > maxElevatedPerPass {
+		names := recordNames(elevations)
+		detail := "this policy would run " + itoa(len(elevations)) +
+			" applications as administrator on this machine, which is past the safety " +
+			"limit of " + itoa(maxElevatedPerPass) + "; nothing was changed. First few: " +
+			strings.Join(names, ", ")
+
+		e.logger.Error("Application control: refusing to grant elevation to an implausible number of applications",
+			zap.Int("would_elevate", len(elevations)), zap.Int("limit", maxElevatedPerPass),
+			zap.Strings("sample", names))
+		e.emit(Event{
+			Mechanism: MechanismRefused, Outcome: OutcomeSkipped, Detail: detail,
+		})
+		return nil, false
+	}
+	out = append(out, elevations...)
+
 	if len(out) > maxBlockedPerPass {
 		names := make([]string, 0, len(out))
 		for _, r := range out {
@@ -589,6 +637,10 @@ func (e *Enforcer) applyLocks(want []lockRecord) {
 	}
 
 	for _, r := range want {
+		if r.Elevated {
+			e.applyElevation(r, held)
+			continue
+		}
 		if r.Quarantined {
 			e.applyQuarantine(r, held)
 			continue
@@ -626,6 +678,10 @@ func (e *Enforcer) applyLocks(want []lockRecord) {
 		if _, keep := wanted[key]; keep {
 			continue
 		}
+		if r.Elevated {
+			e.revokeElevation(key, r)
+			continue
+		}
 		if r.Quarantined {
 			e.releaseQuarantine(key, r)
 			continue
@@ -658,6 +714,10 @@ func (e *Enforcer) applyLocks(want []lockRecord) {
 // disabled still disabled, with the only thing that knew how to undo it gone.
 func (e *Enforcer) Release() {
 	for key, r := range e.state.all() {
+		if r.Elevated {
+			e.revokeElevation(key, r)
+			continue
+		}
 		if r.Quarantined {
 			e.releaseQuarantine(key, r)
 			continue
@@ -866,6 +926,91 @@ func (e *Enforcer) releaseQuarantine(key string, r lockRecord) {
 		zap.String("app", r.Name), zap.String("path", r.Path))
 	e.emit(Event{
 		Mechanism: MechanismRestore, Outcome: OutcomeApplied,
+		AppName: r.Name, Path: r.Path, BundleID: r.BundleID,
+	})
+	e.state.remove(key)
+}
+
+// recordNames lists the applications in a set, for a refusal message.
+//
+// Sorted and capped: the message exists so somebody can recognise what the
+// rule caught, and a hundred names in a log line helps nobody.
+func recordNames(records []lockRecord) []string {
+	names := make([]string, 0, len(records))
+	for _, r := range records {
+		names = append(names, r.Name)
+	}
+	sort.Strings(names)
+	if len(names) > 10 {
+		names = names[:10]
+	}
+	return names
+}
+
+// applyElevation grants one application the right to run elevated.
+//
+// Reported every pass it fails, never suppressed. A grant that cannot be made
+// is a rule an operator believes is working, and on a platform that cannot
+// honour it at all that belief would otherwise last for ever — which is
+// precisely how the elevate action came to be a no-op that the portal
+// advertised as "Run it with admin rights".
+func (e *Enforcer) applyElevation(r lockRecord, held map[string]lockRecord) {
+	_, already := held[r.Key]
+
+	if err := e.elevator.Allow(targetOf(r)); err != nil {
+		if !already {
+			e.logger.Warn("Application control: could not grant elevation",
+				zap.String("app", r.Name), zap.String("rule", r.Rule),
+				zap.String("mechanism", e.elevator.Kind()), zap.Error(err))
+		}
+		// Emitted on every pass, not only the first: emit() already collapses
+		// identical events to one per five minutes, and an unsupported
+		// platform must keep saying so for as long as the rule stands.
+		e.emit(Event{
+			Mechanism: MechanismElevate, Outcome: OutcomeFailed,
+			AppName: r.Name, Path: r.Path, BundleID: r.BundleID,
+			Rule: r.Rule, Policy: r.Policy, Detail: err.Error(),
+		})
+		return
+	}
+	if already {
+		return
+	}
+
+	// Logged at Warn, deliberately. Everything else in this package takes
+	// rights away; this hands them out, and it is the line somebody auditing
+	// the machine needs to find.
+	e.logger.Warn("Application control: an application may now run with administrator rights",
+		zap.String("app", r.Name), zap.String("path", r.Path),
+		zap.String("rule", r.Rule), zap.String("policy", r.Policy),
+		zap.String("mechanism", e.elevator.Kind()))
+	e.emit(Event{
+		Mechanism: MechanismElevate, Outcome: OutcomeApplied,
+		AppName: r.Name, Path: r.Path, BundleID: r.BundleID,
+		Rule: r.Rule, Policy: r.Policy,
+	})
+	e.state.add(r)
+}
+
+// revokeElevation withdraws a grant once the policy stops asking for it.
+func (e *Enforcer) revokeElevation(key string, r lockRecord) {
+	if err := e.elevator.Revoke(targetOf(r)); err != nil {
+		e.logger.Error("Application control: could not withdraw an elevation grant",
+			zap.String("app", r.Name), zap.String("path", r.Path), zap.Error(err))
+		e.emit(Event{
+			Mechanism: MechanismElevateRevoked, Outcome: OutcomeFailed,
+			AppName: r.Name, Path: r.Path, Detail: err.Error(),
+		})
+		// The record is KEPT so the next pass tries again. A grant that could
+		// not be withdrawn and is then forgotten is a way to run something as
+		// administrator that nothing left on the machine knows about.
+		return
+	}
+
+	e.logger.Info("Application control: withdrew an elevation grant",
+		zap.String("app", r.Name), zap.String("path", r.Path))
+	e.emit(Event{
+		Mechanism: MechanismElevateRevoked, Outcome: OutcomeApplied,
 		AppName: r.Name, Path: r.Path, BundleID: r.BundleID,
 	})
 	e.state.remove(key)

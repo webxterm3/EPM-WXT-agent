@@ -30,7 +30,16 @@ const (
 	macLaunchDaemonPlist = "/Library/LaunchDaemons/" + agent.LaunchDaemonLabel + ".plist"
 	macConfigPath        = "/etc/vsay/agent.yaml"
 	macLogPath           = "/var/log/vsay/agent.log"
-	macInstallDir        = "/usr/local/bin"
+	// macDaemonOutPath catches what the LOGGER never sees — a panic, a
+	// dynamic-linker failure, anything printed before zap exists or after it
+	// is gone.
+	//
+	// Deliberately NOT macLogPath. It was, and the agent writes its log file
+	// directly as well, so every line landed twice: once written, once
+	// captured from stdout. A log in which everything appears twice reads as
+	// an agent doing everything twice, which is a long way to chase.
+	macDaemonOutPath = "/var/log/vsay/agent.out.log"
+	macInstallDir    = "/usr/local/bin"
 	// The menu bar item: a per-user LaunchAgent, installed machine-wide so it
 	// starts for whoever logs in rather than only for whoever installed it.
 	macMenuBarBinary = "/usr/local/bin/wxt-agent-menubar"
@@ -333,7 +342,7 @@ func setupLaunchDaemon() error {
 	<string>%s</string>
 </dict>
 </plist>
-`, macLaunchDaemonLabel, runPath, macConfigPath, macLogPath, macLogPath)
+`, macLaunchDaemonLabel, runPath, macConfigPath, macDaemonOutPath, macDaemonOutPath)
 
 	// LaunchDaemon plists must be owned by root and not group/world writable,
 	// or launchd refuses to load them.

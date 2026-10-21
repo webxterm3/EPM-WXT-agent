@@ -12,6 +12,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -73,24 +74,145 @@ func blockedProgramName(args []string) string {
 }
 
 // currentState is read by the Cocoa side on every tick.
-func currentState() (connected bool, title, detail string) {
+//
+// Three strings rather than one: the headline answer, the machine this is,
+// and where its policy stands. They are separate rows because they go stale at
+// completely different rates — the connection changes by the second, the
+// policy by the week — and one line mixing them would make the fresher fact
+// vouch for the older one.
+func currentState() (connected bool, title, detail, sync string) {
 	st, ok := agentstatus.Read()
 	switch {
 	case !ok:
-		return false, "wxt-agent: not installed", "The agent has not reported yet."
+		return false, "wxt-agent not installed", "The agent has not reported yet.", policyLine(st, false)
 	case st.Stale(staleAfter):
-		return false, "wxt-agent: not running",
-			fmt.Sprintf("Last reported %s ago.", time.Since(st.UpdatedAt).Round(time.Second))
+		return false, "wxt-agent not running",
+			fmt.Sprintf("Last reported %s ago", shortDuration(time.Since(st.UpdatedAt))),
+			policyLine(st, false)
 	case st.Connected:
-		return true, "wxt-agent: connected",
-			fmt.Sprintf("%s · %s", nonEmpty(st.Machine, "this Mac"), nonEmpty(st.Server, "server unknown"))
+		return true, "wxt-agent connected" + connectedFor(st),
+			fmt.Sprintf("%s · %s", nonEmpty(st.Machine, "this Mac"), nonEmpty(st.Server, "server unknown")),
+			policyLine(st, true)
 	default:
-		d := "Not connected to the server."
+		d := "Not connected to the server"
 		if st.LastError != "" {
 			d = st.LastError
 		}
-		return false, "wxt-agent: not connected", d
+		return false, "wxt-agent not connected", d, policyLine(st, false)
 	}
+}
+
+// connectedFor says how long the CURRENT connection has lasted.
+//
+// Empty when the agent has not published a start time — an agent from before
+// that field existed, which reports connected without saying since when.
+// Saying "connected · 0s" there would be a worse answer than saying nothing.
+func connectedFor(st agentstatus.Status) string {
+	if st.ConnectedSince.IsZero() {
+		return ""
+	}
+	d := time.Since(st.ConnectedSince)
+	if d < 0 {
+		// The agent's clock ran ahead of this one, or the file was written
+		// during a clock change. A negative age is worse than no age.
+		return ""
+	}
+	return " · " + shortDuration(d)
+}
+
+// policyLine reports when policy last arrived and what it contained.
+//
+// Deliberately distinct from the connection: a machine can be connected for a
+// week and hold a policy from a month ago, and the menu's job is to let
+// somebody see that without opening the portal.
+func policyLine(st agentstatus.Status, connected bool) string {
+	if st.PolicySyncedAt.IsZero() {
+		if connected {
+			return "Policy not synced yet"
+		}
+		return "Policy never synced"
+	}
+
+	when := shortDuration(time.Since(st.PolicySyncedAt))
+	line := "Policy synced " + when + " ago"
+
+	switch {
+	case st.PolicyRules == 1:
+		line += " · 1 rule"
+	case st.PolicyRules > 1:
+		line += fmt.Sprintf(" · %d rules", st.PolicyRules)
+	default:
+		// Zero rules is a real and confusing state — a policy did arrive,
+		// and it says nothing about anything. Named rather than left as a
+		// missing clause that reads like a rendering fault.
+		line += " · no rules"
+	}
+	if st.PolicyMode != "" {
+		line += ", " + st.PolicyMode
+	}
+	return line
+}
+
+// shortDuration formats an age the way somebody reads a status line: the
+// largest unit that still carries information, not a full breakdown.
+//
+// time.Duration's own String gives "2h14m9.3s", which is precise and unusable
+// at a glance — and the glance is the entire purpose of this menu.
+func shortDuration(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		h := int(d.Hours())
+		m := int(d.Minutes()) - h*60
+		if m == 0 {
+			return fmt.Sprintf("%dh", h)
+		}
+		return fmt.Sprintf("%dh %dm", h, m)
+	default:
+		days := int(d.Hours()) / 24
+		h := int(d.Hours()) - days*24
+		if h == 0 {
+			return fmt.Sprintf("%dd", days)
+		}
+		return fmt.Sprintf("%dd %dh", days, h)
+	}
+}
+
+// requestSync asks the agent to fetch policy now.
+//
+// The menu bar cannot fetch anything itself: it runs as the logged-in user and
+// the connection belongs to the root daemon. It writes a request the agent
+// picks up within a second.
+//
+// It reports what it DID — asked — rather than what it hopes will happen. The
+// agent may be offline, and this program has no way to find out; claiming
+// "synced" here would be a guess presented as a fact. The sync line above
+// updates on its own when policy actually lands, which is the real answer.
+func requestSync() {
+	if err := agentstatus.RequestSync(); err != nil {
+		// Two different problems, and they send somebody to different places.
+		// The first version reported both as "the agent is not installed",
+		// which was wrong in the common case and unhelpful in the other.
+		if errors.Is(err, agentstatus.ErrSyncUnavailable) {
+			showText("The agent is not running",
+				"Sync Now needs the agent, and it has not started on this machine.\n\n"+
+					"Check \"Agent Status…\" above. If it says the agent is not running, "+
+					"the policy on this machine is whatever it last received.")
+			return
+		}
+		showText("Could not ask for a sync",
+			"The request could not be written:\n\n"+err.Error()+
+				"\n\nThis is unexpected — the agent prepares that file when it starts. "+
+				"The agent log will say whether it could.")
+		return
+	}
+	showText("Sync requested",
+		"The agent has been asked to fetch the latest policy.\n\n"+
+			"If it is connected, the \"Policy synced\" line updates within a few seconds. "+
+			"If it is offline, the request is dropped and policy arrives when it reconnects.")
 }
 
 func nonEmpty(s, fallback string) string {
@@ -116,14 +238,31 @@ func showStatus() {
 		state = "not running"
 	}
 
+	connFor := "—"
+	if d := connectedFor(st); d != "" {
+		connFor = strings.TrimPrefix(d, " · ")
+	}
+
+	synced := "never"
+	if !st.PolicySyncedAt.IsZero() {
+		synced = fmt.Sprintf("%s ago (%s)",
+			shortDuration(time.Since(st.PolicySyncedAt)),
+			st.PolicySyncedAt.Local().Format("2 Jan 15:04"))
+	}
+
 	body := fmt.Sprintf(
-		"State:     %s\nMachine:   %s\nAgent ID:  %s\nServer:    %s\nVersion:   %s\nReported:  %s ago",
+		"State:      %s\nConnected:  %s\nMachine:    %s\nAgent ID:   %s\nServer:     %s\nVersion:    %s\nReported:   %s ago\n\n"+
+			"Policy\n  Synced:   %s\n  Rules:    %d\n  Mode:     %s",
 		state,
+		connFor,
 		nonEmpty(st.Machine, "—"),
 		nonEmpty(st.AgentID, "—"),
 		nonEmpty(st.Server, "—"),
 		nonEmpty(st.Version, "—"),
-		time.Since(st.UpdatedAt).Round(time.Second),
+		shortDuration(time.Since(st.UpdatedAt)),
+		synced,
+		st.PolicyRules,
+		nonEmpty(st.PolicyMode, "—"),
 	)
 	if st.LastError != "" {
 		body += "\n\nLast error:\n" + st.LastError
