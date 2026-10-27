@@ -169,3 +169,63 @@ func TestAnUnpreparedRequestInARootOwnedDirectoryIsNotAPermissionError(t *testin
 		t.Errorf("got %v, want ErrSyncUnavailable", err)
 	}
 }
+
+// The install request names a PATH, and that path is not an instruction. The
+// agent looks it up among the installers it has already scanned and judged;
+// a path it does not recognise is ignored.
+//
+// That distinction is the whole safety of letting an unprivileged process
+// write this file: it can pick one of the agent's own approved installers, it
+// cannot name an arbitrary file to be run as root.
+func TestAnInstallRequestCarriesOnlyAPath(t *testing.T) {
+	withTempStatusDir(t)
+
+	if err := PrepareInstallRequest(); err != nil {
+		t.Fatal(err)
+	}
+	if got := TakeInstallRequest(); got != "" {
+		t.Errorf("an empty request file returned %q", got)
+	}
+
+	const want = "/Users/someone/Downloads/VSCode.pkg"
+	if err := RequestInstall(want); err != nil {
+		t.Fatal(err)
+	}
+	if got := TakeInstallRequest(); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// Consumed: a request that fired once must not fire on every tick after.
+	if got := TakeInstallRequest(); got != "" {
+		t.Errorf("the same request was taken twice, returning %q", got)
+	}
+}
+
+// Same directory-permission story as the sync request: the menu bar runs as
+// the logged-in user and /var/log/vsay belongs to root.
+func TestAskingToInstallNeedsNoPermissionOnTheDirectory(t *testing.T) {
+	withTempStatusDir(t)
+	if err := PrepareInstallRequest(); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := filepath.Dir(installRequestPath())
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Skipf("cannot restrict the directory here: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	if err := RequestInstall("/Users/someone/Downloads/x.pkg"); err != nil {
+		t.Fatalf("asking needed permission on the directory: %v", err)
+	}
+}
+
+func TestAnUnpreparedInstallRequestSaysSo(t *testing.T) {
+	withTempStatusDir(t)
+	err := RequestInstall("/x.pkg")
+	if err == nil {
+		t.Fatal("asking succeeded with no file prepared")
+	}
+	if !errors.Is(err, ErrSyncUnavailable) {
+		t.Errorf("got %v, want ErrSyncUnavailable", err)
+	}
+}

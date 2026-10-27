@@ -23,6 +23,16 @@ func showText(title, body string) {
 	fmt.Printf("%s\n\n%s\n", title, body)
 }
 
+// confirmText cannot ask anybody anything here, so it answers no.
+//
+// No is the answer that does nothing. Raising an approval request on a
+// platform with no way to show the question would send an administrator a
+// request nobody made.
+func confirmText(title, body, okTitle, cancelTitle string) bool {
+	fmt.Printf("%s\n\n%s\n", title, body)
+	return false
+}
+
 func run() {
 	fmt.Println("There is no system status area on this platform.")
 	fmt.Println("Use `wxt-agent check-permissions` and /var/log/vsay/agent.log instead.")

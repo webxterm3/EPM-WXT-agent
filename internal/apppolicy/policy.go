@@ -14,6 +14,7 @@ package apppolicy
 import (
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Modes. Audit records what would have happened; enforce acts.
@@ -106,6 +107,226 @@ type Effective struct {
 	Mode          string          `json:"mode"`
 	DefaultAction string          `json:"default_action"`
 	Rules         []EffectiveRule `json:"rules"`
+
+	// ApprovedInstalls are one-off exceptions an administrator granted,
+	// usually in answer to a request raised from this machine.
+	//
+	// A NEW field, which is the direction a version mismatch has to fail in:
+	// an agent that predates it ignores it and keeps blocking. Attaching the
+	// same meaning to an existing field would have an old agent half-
+	// understand it and allow something indefinitely.
+	ApprovedInstalls []ApprovedInstall `json:"approved_installs,omitempty"`
+}
+
+// ApprovedInstall is permission for one application, until one moment.
+type ApprovedInstall struct {
+	Application string    `json:"application"`
+	BundleID    string    `json:"bundle_id,omitempty"`
+	Publisher   string    `json:"publisher,omitempty"`
+	Until       time.Time `json:"until"`
+
+	// Operation is what was approved: install, update or remove.
+	//
+	// Empty means install, so an approval stored or sent before this field
+	// existed keeps exactly the meaning it was granted with — and an agent
+	// that predates the field ignores it and reads every approval as the
+	// install approval it already understood, which is the direction a
+	// version mismatch has to fail in.
+	Operation string `json:"operation,omitempty"`
+
+	// Spent marks an approval that has already been used — the software was
+	// installed and this machine said so.
+	//
+	// It stops permitting a NEW install: somebody who uninstalls the
+	// software and wants it back asks again, because the approver agreed to
+	// one install and not to a standing permission for the rest of the day.
+	// It goes on exempting what is already on the machine from enforcement,
+	// which is a different question — the software is there because it was
+	// approved, and withdrawing that would have the agent quarantine the
+	// very thing it had just been told to install.
+	//
+	// Absent on an older backend, which reads as "not spent" — the
+	// behaviour this field changed, so nothing is surprised by its absence.
+	Spent bool `json:"spent,omitempty"`
+}
+
+// Operations an approval can carry.
+const (
+	OpInstall = "install"
+	OpUpdate  = "update"
+	OpRemove  = "remove"
+)
+
+// permits reports whether this approval covers one operation.
+//
+// Installing covers updating and removing: somebody allowed to put an
+// application on this machine is allowed to replace it with a newer one and
+// to take it off again, and making them raise a second request to undo the
+// first would be a worse answer than either. Removing covers only removing —
+// permission to take something off is not permission to put something on.
+func (a ApprovedInstall) permits(op string) bool {
+	switch a.Operation {
+	case "", OpInstall:
+		return true
+	case OpUpdate:
+		return op == OpUpdate || op == OpRemove
+	case OpRemove:
+		return op == OpRemove
+	default:
+		// An operation this build does not know about grants nothing.
+		// Refusing something unrecognised costs a password; honouring it
+		// costs whatever the newer side meant by it.
+		return false
+	}
+}
+
+// InstallApproved reports whether a live exception covers this application.
+//
+// Compared on the name the endpoint reported when it was refused, which is
+// what the approver saw and decided about. Where the approval records a
+// bundle id or a publisher, those must match too — an exception that matched
+// on name alone could be claimed by anything named the same, which is the
+// whole trick this feature has to be proof against.
+// Enforcing reports whether this policy may act on a machine.
+//
+// Audit mode means watch and report; it does not mean act quietly. The
+// install path read nothing about mode at all, so a policy saved in audit —
+// with the tenant's enforcement switch off — still ejected disk images out
+// from under people and still handed out permission to remove applications.
+// The editor says, in those words, "Matches are recorded and projected.
+// Nothing on any machine changes."
+//
+// nil is not enforcing: a machine that has never been told anything has not
+// been told to act.
+func (e *Effective) Enforcing() bool {
+	return e != nil && e.Mode == ModeEnforce
+}
+
+// HasSpentApproval reports whether an approval for this application exists
+// but has already been used.
+//
+// Asked only so a refusal can explain itself: from the outside, software
+// refused because its approval was spent looks exactly like software nobody
+// ever approved, and those are the two cases somebody most needs to tell
+// apart.
+func (e *Effective) HasSpentApproval(name string, now time.Time) bool {
+	if e == nil {
+		return false
+	}
+	for _, a := range e.ApprovedInstalls {
+		if a.Spent && a.Until.After(now) && strings.EqualFold(a.Application, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// Exempt reports whether a live approval covers this program.
+//
+// The ONE place the question is asked, because it is asked from three:
+// deciding about a mounted image, deciding what to lock or quarantine, and
+// deciding what to stop when it launches. Those drifted — only the first
+// consulted approvals at all, so an administrator would approve a request,
+// the agent would install the software, and the enforcement pass seconds
+// later would quarantine it straight back off the machine, or let it sit on
+// disk and kill it every time somebody opened it. From the portal it looked
+// applied; from the Mac it looked like nothing had happened.
+func (e *Effective) Exempt(p Program, now time.Time) bool {
+	if e == nil {
+		return false
+	}
+	// A RULE that blocks is not something an approval may set aside.
+	//
+	// The same precedence the install decision uses, and it has to be the
+	// same here or the two halves of the agent disagree about the same
+	// application: the mount refuses it, and the enforcement pass leaves it
+	// alone because an approval exists — which is an administrator writing a
+	// block rule and watching the software stay exactly where it was.
+	if d := e.Evaluate(p); d.Action == ActionBlock && d.FromRule {
+		return false
+	}
+	// A spent approval still covers what it put there.
+	//
+	// Enforcement is asking whether this may STAY, not whether it may be
+	// installed. Refusing a spent one here would have the agent quarantine
+	// software the moment it finished installing it, on the strength of the
+	// endpoint reporting success.
+	return e.approvalCovers(p.Name, p.BundleID, p.Publisher, now, true)
+}
+
+// RemovalApproved reports whether a live approval names this application, by
+// NAME alone.
+//
+// Deliberately separate from InstallApproved, and deliberately weaker.
+//
+// InstallApproved refuses to match when the caller cannot supply the bundle
+// identifier and publisher the approval was granted against — that is what
+// stops an unsigned lookalike in a disk image inheriting somebody else's
+// permission, and it must stay that way. Calling it with empty strings looks
+// like a lookup and silently never matches, because an endpoint-raised
+// approval always carries both.
+//
+// Removal is a different question. The bundle is already in /Applications,
+// so it was put there by something that passed the install check, and
+// renaming it to impersonate another application needs delete_child on
+// /Applications, which nobody is ever granted. The name is therefore enough
+// here, and reading each installed bundle's signature on every scan would be
+// a codesign call per application every few seconds.
+func (e *Effective) RemovalApproved(name string, now time.Time) bool {
+	for _, a := range e.ApprovedInstalls {
+		if a.Until.After(now) && strings.EqualFold(a.Application, name) && a.permits(OpRemove) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Effective) InstallApproved(name, bundleID, publisher string, now time.Time) bool {
+	return e.approvalCovers(name, bundleID, publisher, now, false)
+}
+
+// approvalCovers is the shared matcher. allowSpent is what separates the two
+// questions an approval answers: may this be installed (no), and may what is
+// already installed stay (yes).
+func (e *Effective) approvalCovers(name, bundleID, publisher string, now time.Time, allowSpent bool) bool {
+	for _, a := range e.ApprovedInstalls {
+		if !a.Until.After(now) {
+			continue
+		}
+		if !strings.EqualFold(a.Application, name) {
+			continue
+		}
+		// Both sides must HAVE an identifier before it can disagree.
+		//
+		// This used to key on the approval's value alone, which failed in
+		// one direction only: an approval recording a bundle id, matched
+		// against a bundle whose Info.plist could not be read, compared the
+		// id against "" and never matched. The person had asked, been
+		// approved, and was still refused — with nothing anywhere saying
+		// why. When either side is missing, the name and the publisher are
+		// what is left to go on, and the publisher is the part that carries
+		// the weight.
+		if a.BundleID != "" && bundleID != "" && !strings.EqualFold(a.BundleID, bundleID) {
+			continue
+		}
+		// EqualFold, like the two comparisons above it. A signing authority
+		// is read back from codesign and matched against a string stored
+		// when the request was raised; a difference in case between the two
+		// is not somebody else's certificate.
+		if a.Publisher != "" && !strings.EqualFold(a.Publisher, publisher) {
+			continue
+		}
+		if !a.permits(OpInstall) {
+			continue
+		}
+		// Already used. Installing again is a new ask — but what is
+		// already on the machine is not asked about again.
+		if a.Spent && !allowSpent {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // Program is a candidate to decide about.

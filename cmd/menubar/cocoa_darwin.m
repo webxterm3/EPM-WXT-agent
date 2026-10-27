@@ -33,6 +33,7 @@
 - (void)uninstall:(id)sender   { wxtMenuUninstall(); }
 - (void)quit:(id)sender        { wxtMenuQuit(); }
 - (void)sync:(id)sender        { wxtMenuSync(); }
+- (void)install:(id)sender     { wxtMenuInstall((int)[sender tag]); }
 - (void)tick:(NSTimer *)t      { wxtRefresh(); }
 @end
 
@@ -40,6 +41,8 @@ static WxtMenuDelegate *g_delegate = nil;
 static NSMenuItem *g_titleItem = nil;
 static NSMenuItem *g_detailItem = nil;
 static NSMenuItem *g_syncItem = nil;
+static NSMenuItem *g_softwareItem = nil;
+static NSMenu *g_softwareMenu = nil;
 
 // wxt_icon draws the shield, with a tick or a cross badge.
 static NSImage *wxt_icon(int connected) {
@@ -195,6 +198,17 @@ void wxt_run(double pollSeconds) {
 		sync.enabled = YES;
 		[menu addItem:sync];
 
+		// Installers sitting in this person's downloads, and what policy says
+		// about each. Hidden entirely while there are none, because an empty
+		// "Software" row invites a click that explains nothing.
+		g_softwareMenu = [[NSMenu alloc] init];
+		g_softwareMenu.autoenablesItems = NO;
+		g_softwareItem = [[NSMenuItem alloc] initWithTitle:@"Software" action:nil keyEquivalent:@""];
+		g_softwareItem.enabled = YES;
+		g_softwareItem.submenu = g_softwareMenu;
+		g_softwareItem.hidden = YES;
+		[menu addItem:g_softwareItem];
+
 		[menu addItem:[NSMenuItem separatorItem]];
 
 		NSMenuItem *st = [[NSMenuItem alloc] initWithTitle:@"Agent Status…"
@@ -272,3 +286,64 @@ void wxt_show_text(const char *title, const char *body) {
 }
 
 void wxt_stop(void) { [NSApp terminate:nil]; }
+
+void wxt_software_begin(void) {
+	if (!g_softwareMenu) return;
+	[g_softwareMenu removeAllItems];
+}
+
+void wxt_software_add(const char *title, const char *detail, int enabled, int tag) {
+	if (!g_softwareMenu) return;
+	@autoreleasepool {
+		NSString *t = [NSString stringWithUTF8String:title];
+		NSMenuItem *item = [[NSMenuItem alloc]
+			initWithTitle:t
+			       action:(enabled ? @selector(install:) : nil)
+			keyEquivalent:@""];
+		item.tag = tag;
+		item.target = g_delegate;
+		// Enabled even when it does nothing, so the row keeps the ordinary
+		// label colour. Grey here would say "unavailable" about software the
+		// person can see perfectly well — the reason underneath says what is
+		// actually true.
+		item.enabled = YES;
+		if (!enabled) {
+			item.attributedTitle = wxt_readout(t, nil);
+		}
+		[g_softwareMenu addItem:item];
+
+		if (detail && detail[0]) {
+			NSMenuItem *sub = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+			sub.enabled = YES;
+			sub.attributedTitle = wxt_secondary(
+				[NSString stringWithUTF8String:detail]);
+			[g_softwareMenu addItem:sub];
+		}
+	}
+}
+
+void wxt_software_end(int count) {
+	if (!g_softwareItem) return;
+	g_softwareItem.hidden = (count == 0);
+	g_softwareItem.title = (count == 1)
+		? @"Software (1)"
+		: [NSString stringWithFormat:@"Software (%d)", count];
+}
+
+int wxt_confirm(const char *title, const char *body, const char *okTitle,
+                const char *cancelTitle) {
+	@autoreleasepool {
+		NSAlert *alert = [[NSAlert alloc] init];
+		alert.messageText = [NSString stringWithUTF8String:title];
+		alert.informativeText = [NSString stringWithUTF8String:body];
+		[alert addButtonWithTitle:[NSString stringWithUTF8String:okTitle]];
+		[alert addButtonWithTitle:[NSString stringWithUTF8String:cancelTitle]];
+
+		// Brought to the front deliberately. This appears because somebody
+		// opened a disk image, so they are looking at Finder — a dialog
+		// behind it would be a notification they never see, about software
+		// they are at that moment trying to install.
+		[NSApp activateIgnoringOtherApps:YES];
+		return ([alert runModal] == NSAlertFirstButtonReturn) ? 1 : 0;
+	}
+}

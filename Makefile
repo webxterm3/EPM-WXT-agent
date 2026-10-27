@@ -524,14 +524,37 @@ deploy-binaries: packages-desktop ## Build macOS + Windows packages and copy to 
 	@echo ""
 	@echo "Deploying packages to $(AGENT_BACKEND_DIR)/agent-binaries/..."
 	@mkdir -p $(AGENT_BACKEND_DIR)/agent-binaries
+	@# Each package is named EXACTLY, from $(VERSION), and a missing one stops
+	@# the deploy.
+	@#
+	@# These used to be picked with `ls -t … | head -1`, the most recently
+	@# written file matching a glob. That is not the same thing as the version
+	@# being deployed: any older build left in dist/ — rebuilt, restored,
+	@# touched — becomes "newest" and is shipped instead, while the VERSION
+	@# file beside it still records $(VERSION). It happened: a stray build
+	@# left 1.0.0-rc3 newer than 1.0.0-rc4 and the deploy quietly shipped rc3.
+	@#
+	@# That is precisely the drift the VERSION file exists to remove, let back
+	@# in through the back door, and its symptom is the worst kind: the portal
+	@# offers an update, every agent installs it, reports the version it really
+	@# got, still does not match, and is offered the same update for ever.
+	@#
 	@# Only macOS and Windows: those are the platforms remote control runs on.
 	@# Linux machines are managed through the terminal and have no desktop to
 	@# take over, so publishing a Linux agent here would advertise a feature it
 	@# cannot provide.
-	@f=$$(ls -t $(DIST_DIR)/dmg/wxt-agent-*-macos-amd64.dmg 2>/dev/null | head -1) && [ -n "$$f" ] && cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-amd64.dmg && echo "  ✓ wxt-agent-amd64.dmg" || echo "  ✗ wxt-agent-amd64.dmg not found (macOS only)"
-	@f=$$(ls -t $(DIST_DIR)/dmg/wxt-agent-*-macos-arm64.dmg 2>/dev/null | head -1) && [ -n "$$f" ] && cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-arm64.dmg && echo "  ✓ wxt-agent-arm64.dmg" || echo "  ✗ wxt-agent-arm64.dmg not found (macOS only)"
-	@f=$$(ls -t $(DIST_DIR)/windows/wxt-agent_*_windows_amd64.exe 2>/dev/null | head -1) && [ -n "$$f" ] && cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-amd64.exe && echo "  ✓ wxt-agent-amd64.exe" || echo "  ✗ wxt-agent-amd64.exe not found"
-	@f=$$(ls -t $(DIST_DIR)/windows/wxt-agent_*_windows_arm64.exe 2>/dev/null | head -1) && [ -n "$$f" ] && cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-arm64.exe && echo "  ✓ wxt-agent-arm64.exe" || echo "  ✗ wxt-agent-arm64.exe not found"
+	@f=$(DIST_DIR)/dmg/wxt-agent-$(VERSION)-macos-amd64.dmg; \
+	 if [ -f "$$f" ]; then cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-amd64.dmg && echo "  ✓ wxt-agent-amd64.dmg ($(VERSION))"; \
+	 else echo "  ✗ $$f does not exist — build it first"; exit 1; fi
+	@f=$(DIST_DIR)/dmg/wxt-agent-$(VERSION)-macos-arm64.dmg; \
+	 if [ -f "$$f" ]; then cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-arm64.dmg && echo "  ✓ wxt-agent-arm64.dmg ($(VERSION))"; \
+	 else echo "  ✗ $$f does not exist — build it first"; exit 1; fi
+	@f=$(DIST_DIR)/windows/wxt-agent_$(VERSION)_windows_amd64.exe; \
+	 if [ -f "$$f" ]; then cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-amd64.exe && echo "  ✓ wxt-agent-amd64.exe ($(VERSION))"; \
+	 else echo "  ✗ $$f does not exist — build it first"; exit 1; fi
+	@f=$(DIST_DIR)/windows/wxt-agent_$(VERSION)_windows_arm64.exe; \
+	 if [ -f "$$f" ]; then cp "$$f" $(AGENT_BACKEND_DIR)/agent-binaries/wxt-agent-arm64.exe && echo "  ✓ wxt-agent-arm64.exe ($(VERSION))"; \
+	 else echo "  ✗ $$f does not exist — build it first"; exit 1; fi
 	@# The terminal-install artefacts: a tarball of the same .app bundle the
 	@# disk image ships, and the script that fetches it. Needed because macOS
 	@# quarantines anything a browser downloads and Gatekeeper then refuses to
@@ -554,6 +577,18 @@ deploy-binaries: packages-desktop ## Build macOS + Windows packages and copy to 
 	@# offered the same update again for ever. Writing it here makes the packages
 	@# and the claim about them one act.
 	@printf '%s' "$(VERSION)" > $(AGENT_BACKEND_DIR)/agent-binaries/VERSION && echo "  ✓ VERSION ($(VERSION))"
+	@# The hash of every package, written beside them.
+	@#
+	@# The agent downloads its own replacement over HTTP from a URL the server
+	@# hands it, and until now it ran whatever came back. A package is code
+	@# that executes as root or SYSTEM, so "whatever came back" is the whole
+	@# of the trust decision — a proxy, a redirect or a compromised host gets
+	@# to choose what the fleet installs.
+	@#
+	@# Written here, at the moment the packages are copied, so the hashes
+	@# cannot describe a different build to the one being served. Generated
+	@# rather than hand-maintained for the same reason VERSION is.
+	@cd $(AGENT_BACKEND_DIR)/agent-binaries && 		shasum -a 256 wxt-agent-*.dmg wxt-agent-*.exe wxt-agent-macos-*.tar.gz 2>/dev/null > SHA256SUMS && 		echo "  ✓ SHA256SUMS ($$(wc -l < SHA256SUMS | tr -d ' ') packages)"
 	@echo ""
 	@echo "✓ Deploy complete!"
 	@ls -lh $(AGENT_BACKEND_DIR)/agent-binaries/ | grep -v gitkeep

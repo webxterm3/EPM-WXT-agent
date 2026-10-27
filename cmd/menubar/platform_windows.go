@@ -85,6 +85,7 @@ const (
 	mbOK          = 0x0000
 	mbYesNo       = 0x0004
 	mbIconInfo    = 0x0040
+	mbIconQuery   = 0x0020
 	mbIconWarning = 0x0030
 	// What MessageBox returns for the Yes button.
 	idYes = 6
@@ -399,6 +400,20 @@ func showText(title, body string) {
 	b, _ := windows.UTF16PtrFromString(body)
 	procMessageBox.Call(uintptr(hwnd),
 		uintptr(unsafe.Pointer(b)), uintptr(unsafe.Pointer(t)), mbOK|mbIconInfo)
+}
+
+// confirmText asks a yes/no question and reports whether yes was chosen.
+//
+// The button text is NOT honoured here. MessageBoxW's Yes and No are fixed
+// and relabelling them means owning a dialog resource, which is a lot of
+// window-class code for two words. The caller's wording goes in the body
+// instead, so the question still reads as a question.
+func confirmText(title, body, okTitle, cancelTitle string) bool {
+	t, _ := windows.UTF16PtrFromString(title)
+	b, _ := windows.UTF16PtrFromString(body)
+	ret, _, _ := procMessageBox.Call(uintptr(hwnd),
+		uintptr(unsafe.Pointer(b)), uintptr(unsafe.Pointer(t)), mbYesNo|mbIconQuery)
+	return ret == idYes
 }
 
 func fatal(what string, err error) {

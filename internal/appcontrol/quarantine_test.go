@@ -296,7 +296,7 @@ func TestQuarantineSurvivesRepeatedPasses(t *testing.T) {
 
 // Somebody reinstalling past a block has to be visible. The refusal to
 // overwrite the held copy is correct; swallowing it is not.
-func TestAReinstallPastAQuarantineIsReported(t *testing.T) {
+func TestAReinstalledApplicationLeavesAgain(t *testing.T) {
 	apps := t.TempDir()
 	state := t.TempDir()
 	dir, _ := fakeApp(t, apps, "Chrome")
@@ -311,18 +311,44 @@ func TestAReinstallPastAQuarantineIsReported(t *testing.T) {
 	e.Drain()
 
 	// The user puts it back.
-	fakeApp(t, apps, "Chrome")
+	reinstalled, _ := fakeApp(t, apps, "Chrome")
 	e.Reconcile(context.Background())
+	e.Drain()
 
-	var reported bool
-	for _, ev := range e.Drain() {
-		if ev.Mechanism == MechanismQuarantine && ev.Outcome == OutcomeFailed {
-			reported = true
-		}
+	// It has to LEAVE again.
+	//
+	// This used to assert only that the reinstall was REPORTED, and the
+	// implementation satisfied that by refusing — it would not overwrite the
+	// copy it already held, so it emitted a failure and left the application
+	// installed. The report was accurate and the outcome was the thing the
+	// policy exists to prevent: a blocked application sitting on the machine,
+	// taking space, for as long as somebody kept putting it back.
+	if _, err := os.Stat(reinstalled); !os.IsNotExist(err) {
+		t.Fatal("a reinstalled application stayed on the machine; being told about " +
+			"it is not the same as it being gone")
 	}
-	if !reported {
-		t.Error("a reinstall past a block was not reported; the portal would show the policy " +
-			"enforcing while the machine runs the software")
+
+	// And the copy taken the first time must still be there. Removing the
+	// application is recoverable only because nothing is ever deleted.
+	// Walked rather than globbed: the held copy sits under the whole of its
+	// original path, which in a test is a temporary directory nobody can
+	// write a pattern for.
+	var held []string
+	_ = filepath.Walk(filepath.Join(state, quarantineDirName),
+		func(path string, info os.FileInfo, err error) error {
+			if err == nil && info.IsDir() && strings.HasPrefix(filepath.Base(path), "Chrome") {
+				held = append(held, path)
+			}
+			return nil
+		})
+
+	if len(held) == 0 {
+		t.Fatal("nothing was kept; a quarantine that deletes is not recoverable")
+	}
+	if len(held) < 2 {
+		t.Errorf("only %d copy was kept. The first quarantine and the reinstall are "+
+			"two different builds of the application, and overwriting one with the "+
+			"other is the data loss this design exists to avoid", len(held))
 	}
 	_ = dir
 }

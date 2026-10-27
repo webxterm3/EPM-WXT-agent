@@ -57,22 +57,38 @@ func quarantine(root string, t Target) (string, error) {
 	}
 
 	dst := quarantinePath(root, src)
-	if _, err := os.Stat(dst); err == nil {
-		// Already held. If the original is somehow back as well, the newer
-		// copy wins and the old one is left where it is rather than silently
-		// overwritten — losing a user's data here is the one unrecoverable
-		// outcome.
-		if _, err := os.Stat(src); err != nil {
-			return dst, nil
-		}
-		return "", fmt.Errorf("%s is already quarantined and has reappeared; not overwriting", src)
-	}
 
 	if _, err := os.Stat(src); err != nil {
 		if os.IsNotExist(err) {
-			return "", nil // nothing installed to move
+			// Nothing installed to move. If a copy is already held, say
+			// where, so the caller knows the application IS put away.
+			if _, held := os.Stat(dst); held == nil {
+				return dst, nil
+			}
+			return "", nil
 		}
 		return "", err
+	}
+
+	// Something is installed AND a copy is already held: the application was
+	// reinstalled past the block.
+	//
+	// This used to refuse — "already quarantined and has reappeared; not
+	// overwriting" — on the reasoning that overwriting the held copy could
+	// lose somebody's data, which is the one unrecoverable outcome here.
+	// The instinct was right and the result was backwards: the refusal left
+	// the BLOCKED APPLICATION INSTALLED. Somebody downloading it again got a
+	// machine that would not open it but kept it, taking space, for ever.
+	//
+	// Both can be kept. The newer copy goes beside the older one under a
+	// numbered name, so nothing is overwritten and the application still
+	// leaves the machine.
+	if _, err := os.Stat(dst); err == nil {
+		next, err := nextFreeQuarantinePath(dst)
+		if err != nil {
+			return "", err
+		}
+		dst = next
 	}
 
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
@@ -111,4 +127,25 @@ func release(root string, original string) error {
 		return err
 	}
 	return os.Rename(held, original)
+}
+
+// nextFreeQuarantinePath finds a name beside an existing held copy.
+//
+// Numbered rather than timestamped: a reinstall loop would otherwise produce
+// a directory nobody can read, and the number says plainly how many times
+// this has happened — which is itself worth knowing when somebody keeps
+// putting back software the organisation has refused.
+//
+// Bounded, because a machine fighting a policy in a loop must not fill its
+// own disk with copies of the argument.
+func nextFreeQuarantinePath(base string) (string, error) {
+	const maxCopies = 10
+	for i := 2; i <= maxCopies; i++ {
+		candidate := fmt.Sprintf("%s (%d)", base, i)
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("this application has been reinstalled past the block %d times; "+
+		"refusing to keep another copy. Clear %s to free the machine", maxCopies, base)
 }

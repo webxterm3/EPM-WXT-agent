@@ -401,8 +401,11 @@ func (e *Enforcer) sweepProcesses(ctx context.Context) {
 		k := t.key()
 		blocked, known := seen[k]
 		if !known {
+			// Asked here too, or an approved application survives on disk
+			// and is killed every single time somebody opens it — which
+			// reads as the application being broken rather than blocked.
 			d := pol.Evaluate(t.program())
-			blocked = d.Action == apppolicy.ActionBlock
+			blocked = d.Action == apppolicy.ActionBlock && !pol.Exempt(t.program(), time.Now())
 			seen[k] = blocked
 			if blocked {
 				// Recorded once per application per sweep, not once per
@@ -499,11 +502,26 @@ func (e *Enforcer) decideLocks(pol *apppolicy.Effective, targets []Target) ([]lo
 	var out []lockRecord
 	var elevations []lockRecord
 	seen := make(map[string]bool, len(targets))
+	now := time.Now()
 
 	for _, t := range targets {
 		if t.Path == "" || isProtectedPath(t.Path) || isOwnBinary(t.Path) || isOwnBinary(t.ExePath) {
 			continue
 		}
+		// An approval is an exception to the rules, so it has to be read
+		// wherever the rules are.
+		//
+		// This loop judged on the rules alone. So an administrator would
+		// approve a request, the agent would install the software — and the
+		// very next enforcement pass, seconds later, would see a bundle a
+		// rule still blocks and quarantine it straight back off the machine.
+		// From the portal the approval looked applied; from the Mac it
+		// looked like nothing had happened, twice.
+		if pol.Exempt(t.program(), now) {
+			seen[t.key()] = true
+			continue
+		}
+
 		d := pol.Evaluate(t.program())
 
 		// Elevation is collected into the same list, so it inherits the one
@@ -549,22 +567,19 @@ func (e *Enforcer) decideLocks(pol *apppolicy.Effective, targets []Target) ([]lo
 	// They are re-judged rather than assumed: the record carries the fields a
 	// rule can match on, so a policy that has genuinely stopped blocking the
 	// application still releases it.
-	// Applications already in quarantine are carried forward.
-	//
-	// Without this the feature undoes itself on its own next pass: a
-	// quarantined application has, by definition, left the inventory — it is
-	// no longer where any collector looks — so it is absent from `targets`,
-	// absent from `out`, and applyLocks reads that absence as "no longer
-	// blocked" and puts it straight back. The move itself changes the watched
-	// directory's modification time, so the install watcher fires and the
-	// whole thing repeats, every few seconds, moving somebody's application
-	// back and forth.
-	//
-	// They are re-judged rather than assumed: the record carries the fields a
-	// rule can match on, so a policy that has genuinely stopped blocking the
-	// application still releases it.
 	for _, held := range e.state.all() {
 		if !held.Quarantined || seen[held.Key] {
+			continue
+		}
+		// An approval releases what is already held, not only what is
+		// arriving. Otherwise approving something that had been quarantined
+		// leaves it quarantined for ever: it is not in the inventory any
+		// more, so the loop above never sees it, and this one would keep
+		// re-judging it on the rules alone.
+		if pol.Exempt(apppolicy.Program{
+			Name: held.Name, Publisher: held.Publisher,
+			Path: held.Path, BundleID: held.BundleID,
+		}, now) {
 			continue
 		}
 		d := pol.Evaluate(apppolicy.Program{

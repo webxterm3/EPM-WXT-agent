@@ -53,6 +53,36 @@ var BuildVersion = "dev"
 
 // Agent represents the vsay agent
 type Agent struct {
+	// dragWindowRefused records that macOS will not let an access-control
+	// entry be written on /Applications, so the message is logged once per
+	// run rather than on every scan.
+	dragWindowRefused bool
+
+	// removalGrantRefused is the same, for the per-application entry that
+	// lets somebody drag an application to the Trash.
+	removalGrantRefused bool
+
+	// dragWindowOpen is whether the window onto /Applications is open right
+	// now, published so the menu bar can tell somebody to drag only when
+	// dragging will actually work.
+	dragWindowOpen atomic.Bool
+
+	// removable is which installed bundles policy currently allows this
+	// person to remove, so the menu can offer the right thing for each.
+	removable atomic.Pointer[map[string]bool]
+
+	// unreported are install outcomes that could not be sent yet.
+	//
+	// Kept because this message is what marks an approval USED: losing one
+	// leaves the approval live for the rest of its window, and somebody can
+	// uninstall and reinstall the software all day without asking anybody.
+	unreportedMu sync.Mutex
+	unreported   []installResultPayload
+
+	// sendInstallResultFn is the seam these are tested through. A test that
+	// really opened a gRPC stream would be testing the network.
+	sendInstallResultFn func(installResultPayload) bool
+
 	config             *config.Config
 	logger             *zap.Logger
 	grpcClient         *grpc.Client
@@ -124,6 +154,14 @@ type Agent struct {
 	// policySyncedAt is when application policy last arrived, and what it
 	// contained. Published so the menu bar can answer "is this machine up to
 	// date" without the user opening a portal.
+	// pendingInstalls is the latest verdict on every installer sitting in
+	// somebody's downloads, published for the menu bar to show.
+	pendingInstalls atomic.Pointer[[]agentstatus.PendingInstall]
+
+	// dragGranted is who currently has write access to /Applications, so a
+	// window can be closed the moment it stops being wanted.
+	dragGranted atomic.Pointer[[]string]
+
 	policySyncedAt atomic.Pointer[time.Time]
 	policyRules    atomic.Int64
 	policyMode     atomic.Pointer[string]
@@ -235,6 +273,9 @@ func (a *Agent) publishStatus(connected bool, lastErr string) {
 	if at := a.policySyncedAt.Load(); at != nil {
 		st.PolicySyncedAt = *at
 	}
+	if pending := a.pendingInstalls.Load(); pending != nil {
+		st.PendingInstalls = *pending
+	}
 	st.PolicyRules = int(a.policyRules.Load())
 	if mode := a.policyMode.Load(); mode != nil {
 		st.PolicyMode = *mode
@@ -338,6 +379,11 @@ func (a *Agent) Start(ctx context.Context) error {
 	// enabled — the button has to answer either way, even if the answer is
 	// that nothing changed.
 	go a.syncRequestLoop(ctx)
+
+	// Watches people's download folders for installers, decides each against
+	// policy, and installs the ones it may. A standard user cannot install
+	// anything; the agent can, and does it for them where policy allows.
+	go a.pendingInstallLoop(ctx)
 
 	// tunnelOnce ensures the tunnel goroutine is started only once,
 	// after agentID is known from the first successful registration.
@@ -1574,6 +1620,48 @@ func (a *Agent) handleSelfUpdate(downloadURL string) {
 	}
 	if err := tmpPkg.Close(); err != nil {
 		a.logger.Warn("Self-update: failed to close downloaded package", zap.Error(err))
+	}
+
+	// 2a. Refuse a URL that points anywhere but this agent's own server.
+	//
+	// The backend sends a URL and the agent downloaded it, unchecked. The
+	// bytes are then EXECUTED as root or SYSTEM, so a backend that was wrong
+	// — misconfigured, or in somebody else's hands — could name any host on
+	// the internet and have the fleet run it.
+	//
+	// Checked before the hash, not after: the hash proves the package matches
+	// what a server published, and says nothing about whether that server
+	// should have been asked.
+	if err := checkUpdateSource(downloadURL, a.config.Server.Host); err != nil {
+		a.logger.Error("Self-update refused", zap.Error(err),
+			zap.String("url", downloadURL))
+		a.sendUpdateStatus("update_error", err.Error())
+		return
+	}
+	if updateIsPlaintext(downloadURL) {
+		// Said plainly rather than left implied by a hash check that cannot
+		// deliver here: over http an attacker on the path rewrites the
+		// package and the hash file together, because both are fetched the
+		// same way from the same host.
+		a.logger.Warn("Self-update is being fetched over plain HTTP — the package " +
+			"hash cannot protect against anything able to alter traffic on this " +
+			"network, because it is fetched over the same connection")
+	}
+
+	// 2b. Check the bytes against the hashes published beside the package.
+	//
+	// Until this existed the agent ran whatever the download returned. A
+	// package executes as root or SYSTEM, so "whatever came back" WAS the
+	// trust decision — anything able to answer for that host, or sit between
+	// the agent and it, chose what the fleet installed.
+	//
+	// Refused rather than warned about. A failed update leaves a working
+	// agent; an unverified one may leave something else entirely.
+	a.sendUpdateStatus("update_installing", "verifying the package")
+	if err := a.verifyDownloadedPackage(tmpPkgPath, downloadURL); err != nil {
+		a.logger.Error("Self-update: the package could not be verified", zap.Error(err))
+		a.sendUpdateStatus("update_error", "verification failed: "+err.Error())
+		return
 	}
 
 	// 3. Extract the new binary out of the package (dispatched by file extension).

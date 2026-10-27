@@ -27,8 +27,11 @@ var version = "dev"
 // pollInterval is how often the status file is re-read.
 //
 // The file is a few hundred bytes on local disk, so this is cheap; the limit
-// is how fast somebody expects the icon to turn after a connection drops.
-const pollInterval = 5 * time.Second
+// is how fast somebody expects the icon to turn after a connection drops —
+// and, since the same tick is what raises the install-approval dialog, how
+// long somebody stands in front of a mounted disk image with no idea that
+// dragging it across is going to be refused.
+const pollInterval = 3 * time.Second
 
 // staleAfter is when a published status stops being believed.
 //

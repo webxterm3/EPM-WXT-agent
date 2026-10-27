@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -119,3 +120,129 @@ func TakeSyncRequest() bool {
 // A request left behind would fire on the next start, long after whoever
 // pressed it stopped caring.
 func ClearSyncRequest() { _ = os.Truncate(syncRequestPath(), 0) }
+
+// installRequestPath is where the menu bar asks for one installer to be run.
+func installRequestPath() string {
+	return filepath.Join(filepath.Dir(Path()), "install-request")
+}
+
+// PrepareInstallRequest creates the file the menu bar writes into, the same
+// way and for the same reason as the sync request: /var/log/vsay belongs to
+// root, so an unprivileged process cannot create anything there, and
+// loosening the directory would make the agent's own log writable by every
+// user on the machine.
+func PrepareInstallRequest() error {
+	path := installRequestPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { // #nosec G301
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o666) // #nosec G302,G304
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o666) // #nosec G302
+}
+
+// RequestInstall asks the agent to install one specific installer.
+//
+// The PATH is the whole request, and it is not an instruction: the agent
+// looks it up among the installers it has already scanned and decided about,
+// and a path it does not recognise is ignored. Writing this file cannot name
+// an arbitrary file to be run as root — only pick one the agent had already
+// judged installable.
+func RequestInstall(installerPath string) error {
+	f, err := os.OpenFile(installRequestPath(), os.O_WRONLY|os.O_TRUNC, 0) // #nosec G304
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ErrSyncUnavailable
+		}
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(installerPath + "\n")
+	return err
+}
+
+// TakeInstallRequest returns the path somebody asked to install, and consumes
+// the request.
+//
+// Truncate, not remove, for the directory-permission reason above. Empty
+// means nothing was asked.
+func TakeInstallRequest() string {
+	path := installRequestPath()
+	fi, err := os.Stat(path)
+	if err != nil || fi.Size() == 0 {
+		return ""
+	}
+	data, err := os.ReadFile(path) // #nosec G304 -- the agent's own directory
+	if err != nil {
+		return ""
+	}
+	if err := os.Truncate(path, 0); err != nil {
+		// Not cleared means it would fire again on every tick.
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// installResultPath is where the agent says how an install went.
+//
+// The other direction of the same channel: the menu bar asks, the agent
+// acts, and this is the only way the person who asked finds out. Without it
+// the menu bar can only say what it hopes happened, which is how somebody
+// came to be told their approval request had been sent when it had not.
+func installResultPath() string {
+	return filepath.Join(filepath.Dir(Path()), "install-result")
+}
+
+// PrepareInstallResult creates the file, world-writable for the same reason
+// as the request: the menu bar runs as the logged-in user and has to be able
+// to clear it after reading, and /var/log/vsay belongs to root.
+func PrepareInstallResult() error {
+	path := installResultPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { // #nosec G301
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o666) // #nosec G302,G304
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o666) // #nosec G302
+}
+
+// ReportInstallResult records how one install went. An empty problem means
+// it worked.
+func ReportInstallResult(application, problem string) {
+	f, err := os.OpenFile(installResultPath(), os.O_WRONLY|os.O_TRUNC, 0) // #nosec G304
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	// One line: the application, a tab, and what went wrong if anything.
+	_, _ = f.WriteString(application + "\t" + strings.ReplaceAll(problem, "\n", " ") + "\n")
+}
+
+// TakeInstallResult returns the application and what went wrong, consuming
+// the result. An empty application means there is nothing to report.
+func TakeInstallResult() (application, problem string) {
+	path := installResultPath()
+	fi, err := os.Stat(path)
+	if err != nil || fi.Size() == 0 {
+		return "", ""
+	}
+	data, err := os.ReadFile(path) // #nosec G304 -- the agent's own directory
+	if err != nil {
+		return "", ""
+	}
+	if err := os.Truncate(path, 0); err != nil {
+		return "", ""
+	}
+	app, problem, _ := strings.Cut(strings.TrimSpace(string(data)), "\t")
+	return app, problem
+}

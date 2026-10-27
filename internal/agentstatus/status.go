@@ -19,6 +19,74 @@ import (
 	"time"
 )
 
+// PendingInstall is one downloaded installer and what will happen to it.
+//
+// A flattened copy of the agent's own decision rather than a reference to it:
+// this crosses a file, is read by a different program running as a different
+// user, and anything it has to look up elsewhere is something that can be
+// missing by the time it looks.
+type PendingInstall struct {
+	// Path identifies it, and is what the menu bar sends back to ask for an
+	// install. Shown too, because two downloads of the same thing are
+	// otherwise indistinguishable.
+	Path string `json:"path"`
+	// User is whose downloads it is in. The menu bar shows only its own
+	// user's, since offering to install from somebody else's folder is a
+	// surprising thing to put in front of a person.
+	User string `json:"user,omitempty"`
+
+	Label  string `json:"label"`
+	Format string `json:"format"`
+	// Publisher is who the operating system says signed it, empty when
+	// nothing vouches for it.
+	Publisher string `json:"publisher,omitempty"`
+	SizeBytes int64  `json:"size_bytes,omitempty"`
+	// Closed reports that the agent has ejected the image this was in.
+	//
+	// The menu bar needs to know, because the two situations call for
+	// different words: software that is sitting there refusing to install is
+	// not the same as software whose image is no longer open, and telling
+	// somebody to drag across something that is not on screen any more reads
+	// as a fault.
+	Closed bool `json:"closed,omitempty"`
+	// Requested reports that the agent has already asked for approval and
+	// the ask left the machine.
+	//
+	// The menu bar needs it so it can stop offering to do what has been
+	// done. Raised automatically when the image is opened, because opening
+	// an installer IS the decision — waiting for somebody to find a button
+	// means they have already been refused once for no reason they can see.
+	Requested bool `json:"requested,omitempty"`
+	// CanDrag reports that the window onto /Applications is actually open
+	// for this person right now.
+	//
+	// It is not a given. The window is an access-control entry, and a
+	// managed Mac refuses to write one even to root — so on many machines
+	// dragging an approved application across meets the administrator
+	// password sheet. The menu bar needs to know which it is, because
+	// telling somebody to drag something that cannot be dragged is worse
+	// than not telling them anything.
+	CanDrag bool `json:"can_drag,omitempty"`
+	// Installed marks a row that is an application already on the machine
+	// rather than one sitting in a mounted disk image.
+	Installed bool `json:"installed,omitempty"`
+	// Removable reports that policy allows this person to remove it. When
+	// it does not, the row offers to ask instead.
+	Removable bool `json:"removable,omitempty"`
+
+	// Outcome is one of installable, blocked, unverified, unsupported,
+	// no-policy. Reason is the sentence to show.
+	Outcome string `json:"outcome"`
+	Reason  string `json:"reason"`
+	Rule    string `json:"rule,omitempty"`
+	Policy  string `json:"policy,omitempty"`
+
+	// Installing and LastError describe an attempt in progress or just
+	// finished, so a person who pressed the button sees something happen.
+	Installing bool   `json:"installing,omitempty"`
+	LastError  string `json:"last_error,omitempty"`
+}
+
 // Status is what the agent publishes about itself.
 type Status struct {
 	// Connected is the single fact the menu bar exists to show.
@@ -58,6 +126,16 @@ type Status struct {
 	// reader can say what arrived rather than only when.
 	PolicyRules int    `json:"policy_rules,omitempty"`
 	PolicyMode  string `json:"policy_mode,omitempty"`
+
+	// PendingInstalls are installers sitting in people's download folders,
+	// with what policy says about each.
+	//
+	// Published here rather than discovered by the menu bar, for the same
+	// reason the permission state is: the menu bar runs as the logged-in user
+	// and cannot read another account's downloads, check a package signature
+	// against the system's trust store, or see the policy at all. One side
+	// decides; the other shows.
+	PendingInstalls []PendingInstall `json:"pending_installs,omitempty"`
 
 	// LastError is the most recent reason the agent could not connect, if any.
 	LastError string `json:"last_error,omitempty"`
