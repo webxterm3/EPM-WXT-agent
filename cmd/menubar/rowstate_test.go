@@ -195,3 +195,29 @@ func TestApplicationsPolicyDoesNotAllowRemovingAreNotListed(t *testing.T) {
 			"already on the machine", row.title)
 	}
 }
+
+// Somebody who meets Finder's password prompt has no way of knowing there
+// is another way.
+//
+// That prompt comes from Finder, not from this product, and says nothing
+// about the agent. The one place they are already looking when they give up
+// is this menu, so it is the only place the working route can be said.
+func TestTheMenuSaysWhereTheWorkingRouteIsWhenDraggingFails(t *testing.T) {
+	note := withDragNote("macbook · http://192.168.1.8:8082",
+		agentstatus.Status{DragUnavailable: true})
+
+	if !strings.Contains(note, "Software") {
+		t.Errorf("the menu does not point at the route that works: %q", note)
+	}
+	if !strings.Contains(note, "macbook") {
+		t.Errorf("the note replaced the detail instead of adding to it: %q", note)
+	}
+}
+
+// And says nothing when dragging works, because then there is nothing to say.
+func TestTheMenuIsQuietWhenDraggingWorks(t *testing.T) {
+	detail := "macbook · http://192.168.1.8:8082"
+	if got := withDragNote(detail, agentstatus.Status{}); got != detail {
+		t.Errorf("said something about dragging on a Mac where it works: %q", got)
+	}
+}

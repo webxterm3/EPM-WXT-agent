@@ -251,6 +251,13 @@ func (a *Agent) publishStatus(connected bool, lastErr string) {
 		LastError: lastErr,
 
 		PermissionsOK: a.permOK.Load(),
+
+		// A fact about the Mac, not about any one application: macOS will
+		// not write the entry that lets somebody move applications
+		// themselves. Published so the menu can say where the route that
+		// DOES work is, to somebody who has just met Finder's password
+		// prompt and has no idea there is another way.
+		DragUnavailable: a.dragWindowRefused,
 	}
 	if note := a.permNote.Load(); note != nil {
 		st.PermissionNote = *note

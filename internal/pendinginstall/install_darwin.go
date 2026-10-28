@@ -104,3 +104,32 @@ func InstallBundle(src string) error {
 	}
 	return nil
 }
+
+// InstallMounted installs whatever is in a mounted image, by what it is.
+//
+// One entry point rather than two, because the choice between copying a
+// bundle and running a package is not a decision the caller should be making
+// — it is a property of the thing that was found, decided when the image was
+// read. A caller that got it wrong would run `installer` against a folder, or
+// copy a package into /Applications as though it were an application.
+func InstallMounted(app MountedApp) error {
+	if app.Kind != KindPackage {
+		return InstallBundle(app.BundlePath)
+	}
+
+	// Checked again here, with the file in hand.
+	//
+	// DecideMounted already refuses an unsigned package — it has no
+	// publisher, so it comes out unverified, which is not even requestable.
+	// This is not that check repeated out of habit: the decision was made
+	// when the image was mounted, and what is on disk at the moment the
+	// installer runs is a different fact. The image is writable in principle
+	// and the decision is minutes old; between the two, this is the one
+	// instant that matters, because what follows runs as root.
+	if verifiedPackageSigner(app.BundlePath) == "" {
+		return fmt.Errorf("%s is not signed by anyone this Mac trusts, "+
+			"and an installer package runs with full privilege",
+			filepath.Base(app.BundlePath))
+	}
+	return installPackage(app.BundlePath)
+}

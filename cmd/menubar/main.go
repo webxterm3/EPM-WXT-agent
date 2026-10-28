@@ -94,7 +94,8 @@ func currentState() (connected bool, title, detail, sync string) {
 			policyLine(st, false)
 	case st.Connected:
 		return true, "wxt-agent connected" + connectedFor(st),
-			fmt.Sprintf("%s · %s", nonEmpty(st.Machine, "this Mac"), nonEmpty(st.Server, "server unknown")),
+			withDragNote(fmt.Sprintf("%s · %s",
+				nonEmpty(st.Machine, "this Mac"), nonEmpty(st.Server, "server unknown")), st),
 			policyLine(st, true)
 	default:
 		d := "Not connected to the server"
@@ -154,6 +155,20 @@ func policyLine(st agentstatus.Status, connected bool) string {
 		line += ", " + st.PolicyMode
 	}
 	return line
+}
+
+// dragLine says where the route that works is.
+//
+// Somebody who drags an application into Applications, or to the Trash, and
+// meets Finder's password prompt has no way of knowing there is another way
+// — the prompt comes from Finder, not from this product, and it says nothing
+// about the agent. The one place they are already looking when they give up
+// is this menu.
+func withDragNote(detail string, st agentstatus.Status) string {
+	if !st.DragUnavailable {
+		return detail
+	}
+	return detail + "\nDragging apps asks for a password on this Mac — use Software below"
 }
 
 // shortDuration formats an age the way somebody reads a status line: the

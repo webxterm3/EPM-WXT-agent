@@ -73,6 +73,14 @@ type PendingInstall struct {
 	// Removable reports that policy allows this person to remove it. When
 	// it does not, the row offers to ask instead.
 	Removable bool `json:"removable,omitempty"`
+	// Updates reports that a version of this application is already
+	// installed, so acting on this row replaces it rather than adding one.
+	Updates bool `json:"updates,omitempty"`
+	// Version is what the mounted image carries, InstalledVersion what is
+	// already on the machine. Shown together so somebody can see whether
+	// they are moving forwards.
+	Version          string `json:"version,omitempty"`
+	InstalledVersion string `json:"installed_version,omitempty"`
 
 	// Outcome is one of installable, blocked, unverified, unsupported,
 	// no-policy. Reason is the sentence to show.
@@ -89,6 +97,16 @@ type PendingInstall struct {
 
 // Status is what the agent publishes about itself.
 type Status struct {
+	// DragUnavailable reports that macOS refuses the access-control entry
+	// that would let somebody drag applications into Applications or to the
+	// Trash.
+	//
+	// Published at the top level, not per row, because it is a fact about
+	// the Mac rather than about one application — and because somebody who
+	// has just met Finder's password prompt needs to be told where the
+	// working route is, before they go looking for a row.
+	DragUnavailable bool `json:"drag_unavailable,omitempty"`
+
 	// Connected is the single fact the menu bar exists to show.
 	Connected bool `json:"connected"`
 

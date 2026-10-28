@@ -53,6 +53,10 @@ type MountedApp struct {
 	Version   string
 	Publisher string
 
+	// Kind is what sort of thing this is: an application bundle somebody
+	// would drag across, or an installer package that has to be run.
+	Kind string
+
 	MountedAt time.Time
 }
 
@@ -130,16 +134,32 @@ func appInVolume(vol string) (MountedApp, bool) {
 		return MountedApp{}, false
 	}
 
-	var found string
+	var found, foundPkg string
 	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".app") {
-			continue
+		switch {
+		case strings.HasSuffix(e.Name(), ".app"):
+			if found != "" {
+				// More than one: there is no single thing being installed.
+				return MountedApp{}, false
+			}
+			found = filepath.Join(vol, e.Name())
+		case strings.HasSuffix(e.Name(), ".pkg"), strings.HasSuffix(e.Name(), ".mpkg"):
+			if foundPkg != "" {
+				return MountedApp{}, false
+			}
+			foundPkg = filepath.Join(vol, e.Name())
 		}
-		if found != "" {
-			// More than one: there is no single thing being installed.
-			return MountedApp{}, false
-		}
-		found = filepath.Join(vol, e.Name())
+	}
+
+	// An image carrying both is ambiguous: the package usually installs the
+	// application, and acting on one of them is a guess about which the
+	// person meant.
+	if found != "" && foundPkg != "" {
+		return MountedApp{}, false
+	}
+
+	if foundPkg != "" {
+		return packageInVolume(vol, foundPkg)
 	}
 	if found == "" {
 		return MountedApp{}, false
@@ -153,6 +173,29 @@ func appInVolume(vol string) (MountedApp, bool) {
 	}
 	app.BundleID, app.Version, app.Name = bundleIdentity(found, app.Name)
 	app.Publisher = verifiedBundleSigner(found)
+	return app, true
+}
+
+// packageInVolume describes an installer package sitting in a mounted image.
+//
+// The NAME is the file's, without the extension. A package does not say what
+// it calls itself anywhere a cheap read can reach — the identifier lives
+// inside the archive — and the file name is what the person downloaded and
+// what they will look for in a menu.
+//
+// There is no bundle identifier, so a policy rule that matches on one cannot
+// match a package. That is the right direction to fail in: the rule does not
+// apply, the package resolves to "no rule covers this", and somebody has to
+// approve it rather than it slipping through.
+func packageInVolume(vol, pkg string) (MountedApp, bool) {
+	app := MountedApp{
+		Volume:     vol,
+		BundlePath: pkg,
+		Kind:       KindPackage,
+		Name:       strings.TrimSuffix(strings.TrimSuffix(filepath.Base(pkg), ".mpkg"), ".pkg"),
+		MountedAt:  time.Now(),
+	}
+	app.Publisher = verifiedPackageSigner(pkg)
 	return app, true
 }
 

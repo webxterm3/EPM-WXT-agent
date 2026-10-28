@@ -5,7 +5,7 @@ package pendinginstall
 // Mounting a disk image to drag an application out of it is a macOS idea.
 
 type MountedApp struct {
-	Volume, BundlePath, Name, BundleID, Version, Publisher string
+	Volume, BundlePath, Name, BundleID, Version, Publisher, Kind string
 }
 
 func MountedApps() []MountedApp { return nil }

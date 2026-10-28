@@ -20,6 +20,15 @@ import (
 
 // softwareRow is one line in the Software submenu.
 type softwareRow struct {
+	// name is the application, carried from the agent rather than parsed
+	// back out of the title.
+	//
+	// The menu groups by it, and a title is a sentence built for display —
+	// "Visual Studio Code — update" — so recovering the name from one meant
+	// a list of suffixes to strip, kept in step by hand. The moment a new
+	// wording was added without it, the same application appeared twice in
+	// the menu under two names.
+	name   string
 	title  string
 	detail string
 	path   string
@@ -45,6 +54,11 @@ type softwareRow struct {
 	installed bool
 	// removable reports that policy allows this person to remove it.
 	removable bool
+	// updates reports that acting on this row REPLACES a version already
+	// installed, rather than adding one.
+	updates bool
+	// versions is "1.2 → 1.3" where both are known.
+	versions string
 }
 
 // clickable reports whether a row does anything when clicked.
@@ -102,6 +116,7 @@ func rowFor(p agentstatus.PendingInstall) softwareRow {
 	requestable := pendinginstall.Outcome(p.Outcome).Requestable()
 
 	row := softwareRow{
+		name:        label,
 		title:       label,
 		detail:      p.Reason,
 		path:        p.Path,
@@ -111,6 +126,8 @@ func rowFor(p agentstatus.PendingInstall) softwareRow {
 		canDrag:     p.CanDrag,
 		installed:   p.Installed,
 		removable:   p.Removable,
+		updates:     p.Updates,
+		versions:    versionChange(p.InstalledVersion, p.Version),
 	}
 
 	if p.Installed {
@@ -308,8 +325,21 @@ func sendInstallRequest(row softwareRow) {
 			"asking you for anything.")
 }
 
+// versionChange reads as a move from one version to another, where both are
+// known. Empty when either is missing: "→ 1.3" alone says nothing somebody
+// can act on.
+func versionChange(installed, offered string) string {
+	if installed == "" || offered == "" || installed == offered {
+		return ""
+	}
+	return installed + " → " + offered
+}
+
 // appNameOf is the row title without the status that was appended to it.
 func appNameOf(row softwareRow) string {
+	if row.name != "" {
+		return row.name
+	}
 	name := row.title
 	for _, suffix := range []string{
 		" — needs approval", " — approval requested",

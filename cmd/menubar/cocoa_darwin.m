@@ -43,6 +43,7 @@ static NSMenuItem *g_detailItem = nil;
 static NSMenuItem *g_syncItem = nil;
 static NSMenuItem *g_softwareItem = nil;
 static NSMenu *g_softwareMenu = nil;
+static NSMenu *g_currentApp = nil;
 
 // wxt_icon draws the shield, with a tick or a cross badge.
 static NSImage *wxt_icon(int connected) {
@@ -200,10 +201,10 @@ void wxt_run(double pollSeconds) {
 
 		// Installers sitting in this person's downloads, and what policy says
 		// about each. Hidden entirely while there are none, because an empty
-		// "Software" row invites a click that explains nothing.
+		// "Applications" row invites a click that explains nothing.
 		g_softwareMenu = [[NSMenu alloc] init];
 		g_softwareMenu.autoenablesItems = NO;
-		g_softwareItem = [[NSMenuItem alloc] initWithTitle:@"Software" action:nil keyEquivalent:@""];
+		g_softwareItem = [[NSMenuItem alloc] initWithTitle:@"Applications" action:nil keyEquivalent:@""];
 		g_softwareItem.enabled = YES;
 		g_softwareItem.submenu = g_softwareMenu;
 		g_softwareItem.hidden = YES;
@@ -290,44 +291,66 @@ void wxt_stop(void) { [NSApp terminate:nil]; }
 void wxt_software_begin(void) {
 	if (!g_softwareMenu) return;
 	[g_softwareMenu removeAllItems];
+	g_currentApp = nil;
 }
 
-void wxt_software_add(const char *title, const char *detail, int enabled, int tag) {
+void wxt_software_app(const char *name) {
 	if (!g_softwareMenu) return;
 	@autoreleasepool {
-		NSString *t = [NSString stringWithUTF8String:title];
+		NSString *t = [NSString stringWithUTF8String:name];
+		NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:t action:nil keyEquivalent:@""];
+		item.enabled = YES;
+
+		NSMenu *sub = [[NSMenu alloc] initWithTitle:t];
+		// The submenu decides for itself what is clickable; without this
+		// AppKit greys out everything that has no action, including the
+		// explanation lines that are meant to be readable.
+		sub.autoenablesItems = NO;
+		item.submenu = sub;
+
+		[g_softwareMenu addItem:item];
+		g_currentApp = sub;
+	}
+}
+
+void wxt_software_note(const char *text) {
+	if (!g_currentApp || !text || !text[0]) return;
+	@autoreleasepool {
+		NSMenuItem *note = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+		note.enabled = NO;
+		note.attributedTitle = wxt_secondary([NSString stringWithUTF8String:text]);
+		[g_currentApp addItem:note];
+		[g_currentApp addItem:[NSMenuItem separatorItem]];
+	}
+}
+
+void wxt_software_action(const char *label, int enabled, int tag) {
+	if (!g_currentApp) return;
+	@autoreleasepool {
+		NSString *t = [NSString stringWithUTF8String:label];
 		NSMenuItem *item = [[NSMenuItem alloc]
 			initWithTitle:t
 			       action:(enabled ? @selector(install:) : nil)
 			keyEquivalent:@""];
 		item.tag = tag;
 		item.target = g_delegate;
-		// Enabled even when it does nothing, so the row keeps the ordinary
-		// label colour. Grey here would say "unavailable" about software the
-		// person can see perfectly well — the reason underneath says what is
-		// actually true.
-		item.enabled = YES;
+		item.enabled = enabled ? YES : NO;
 		if (!enabled) {
+			// A statement, not a choice. Rendered as a readout so it does
+			// not look like a command somebody failed to click.
 			item.attributedTitle = wxt_readout(t, nil);
 		}
-		[g_softwareMenu addItem:item];
-
-		if (detail && detail[0]) {
-			NSMenuItem *sub = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
-			sub.enabled = YES;
-			sub.attributedTitle = wxt_secondary(
-				[NSString stringWithUTF8String:detail]);
-			[g_softwareMenu addItem:sub];
-		}
+		[g_currentApp addItem:item];
 	}
 }
 
 void wxt_software_end(int count) {
 	if (!g_softwareItem) return;
 	g_softwareItem.hidden = (count == 0);
+	g_currentApp = nil;
 	g_softwareItem.title = (count == 1)
-		? @"Software (1)"
-		: [NSString stringWithFormat:@"Software (%d)", count];
+		? @"Applications (1)"
+		: [NSString stringWithFormat:@"Applications (%d)", count];
 }
 
 int wxt_confirm(const char *title, const char *body, const char *okTitle,

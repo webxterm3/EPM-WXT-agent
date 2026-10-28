@@ -62,22 +62,34 @@ func wxtRefresh() {
 // that is no longer there.
 func refreshSoftwareMenu() {
 	items := pendingForThisUser()
+	apps := groupForMenu(items)
 
 	C.wxt_software_begin()
-	for i, it := range items {
-		cTitle := C.CString(it.title)
-		cDetail := C.CString(it.detail)
-		// Clickable where the click does something: installing approved
-		// software, or asking about software that is not approved.
-		enabled := C.int(0)
-		if it.clickable() {
-			enabled = 1
+	for _, app := range apps {
+		cName := C.CString(app.name)
+		C.wxt_software_app(cName)
+		C.free(unsafe.Pointer(cName))
+
+		if app.note != "" {
+			cNote := C.CString(app.note)
+			C.wxt_software_note(cNote)
+			C.free(unsafe.Pointer(cNote))
 		}
-		C.wxt_software_add(cTitle, cDetail, enabled, C.int(i))
-		C.free(unsafe.Pointer(cTitle))
-		C.free(unsafe.Pointer(cDetail))
+
+		for _, a := range app.actions {
+			cLabel := C.CString(a.label)
+			enabled := C.int(0)
+			if a.enabled {
+				enabled = 1
+			}
+			C.wxt_software_action(cLabel, enabled, C.int(a.index))
+			C.free(unsafe.Pointer(cLabel))
+		}
 	}
-	C.wxt_software_end(C.int(len(items)))
+	// Counted in APPLICATIONS, not rows: the heading says how many things
+	// there are to look at, and one application offering two actions is one
+	// thing to look at.
+	C.wxt_software_end(C.int(len(apps)))
 
 	// After the menu is rebuilt, not before: if somebody says no to the
 	// dialog, the row is already there for them to come back to.

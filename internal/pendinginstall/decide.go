@@ -6,6 +6,18 @@ import (
 	"github.com/Yesveer/wxt-agent/internal/apppolicy"
 )
 
+// What kind of thing is sitting in a mounted image.
+const (
+	// KindBundle is an application somebody would drag across. The empty
+	// string, so every MountedApp built before packages existed still reads
+	// as what it is.
+	KindBundle = ""
+	// KindPackage is an installer package: a program that runs as root and
+	// may do anything, which is why its signature is the whole of the trust
+	// decision rather than a label on it.
+	KindPackage = "package"
+)
+
 // Outcome is what the agent will do about a downloaded installer, and why.
 //
 // Five answers rather than a boolean, because they send a person to five

@@ -529,6 +529,15 @@ func (a *Agent) installedRows() []agentstatus.PendingInstall {
 	return out
 }
 
+// installedVersionOf is the version already on the machine, or empty.
+func installedVersionOf(name string) string {
+	bundle := pendinginstall.InstalledBundleFor(name)
+	if bundle == "" {
+		return ""
+	}
+	return pendinginstall.InstalledIdentity(bundle).Version
+}
+
 // askAboutRefusedImage raises the approval request for an image the agent
 // has just refused, and records whether it got out.
 func (a *Agent) askAboutRefusedImage(state *pendingInstallState, volume string) {
@@ -697,10 +706,17 @@ func (a *Agent) closeRefusedImage(state *pendingInstallState, volume string) {
 // bar. Caller holds state.mu.
 func (a *Agent) publishMounted(state *pendingInstallState) {
 	row := func(d pendinginstall.MountedDecision, closed, requested bool) agentstatus.PendingInstall {
+		// "pkg" or "app": a package is run, a bundle is copied, and the
+		// two fail in different ways. Reporting both as "app" would make a
+		// package's install failure unreadable in the portal.
+		format := "app"
+		if d.App.Kind == pendinginstall.KindPackage {
+			format = "pkg"
+		}
 		return agentstatus.PendingInstall{
 			Path:      d.App.BundlePath,
 			Label:     d.App.Name,
-			Format:    "app",
+			Format:    format,
 			Publisher: d.App.Publisher,
 			Outcome:   string(d.Outcome),
 			Reason:    d.Reason,
@@ -708,7 +724,14 @@ func (a *Agent) publishMounted(state *pendingInstallState) {
 			Policy:    d.Policy,
 			Closed:    closed,
 			Requested: requested,
-			CanDrag:   a.dragWindowOpen.Load(),
+			// Replacing a version that is already there is an UPDATE, and
+			// somebody about to do it is entitled to know that is what it
+			// is. Called "install" either way, replacing the application
+			// they were using looked like adding a second copy.
+			Updates:          d.App.Name != "" && pendinginstall.InstalledBundleFor(d.App.Name) != "",
+			Version:          d.App.Version,
+			InstalledVersion: installedVersionOf(d.App.Name),
+			CanDrag:          a.dragWindowOpen.Load(),
 		}
 	}
 
@@ -1020,7 +1043,7 @@ func sameVolumes(a, b []string) bool {
 
 // installApproved puts an approved application into /Applications.
 func (a *Agent) installApproved(d pendinginstall.MountedDecision) {
-	err := pendinginstall.InstallBundle(d.App.BundlePath)
+	err := pendinginstall.InstallMounted(d.App)
 	if err != nil {
 		a.logger.Error("Could not install approved software",
 			zap.String("application", d.App.Name), zap.Error(err))

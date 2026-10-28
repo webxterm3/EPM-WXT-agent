@@ -4,13 +4,16 @@ package pendinginstall
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -429,11 +432,83 @@ func setRights(path, user, rights string, add bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, "/bin/chmod", flag, entry, path).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s %s on %s: %w: %s", flag, user, path, err, strings.TrimSpace(string(out)))
+	out, err := runChmod(ctx, nil, flag, entry, path)
+	if err == nil {
+		return nil
 	}
-	return nil
+
+	// Refused. Asked once more from inside the console user's session.
+	//
+	// A LaunchDaemon runs as root with NO session attached, and that is the
+	// case macOS is most willing to refuse outright — no prompt, no row in
+	// System Settings, just EPERM. It fits what was measured here: root
+	// refused an operation root would otherwise be allowed, and granting
+	// App Management by hand changed nothing, which is what ruled the
+	// obvious explanation out.
+	//
+	// `launchctl asuser` does not drop privileges. It stays root and
+	// attaches the session, so this is the same operation asked in the one
+	// context the first attempt could not supply. It costs one process, and
+	// only after the first attempt has already failed.
+	if uid := consoleUIDFn(); uid > 0 {
+		if _, err2 := runChmod(ctx, []string{"/bin/launchctl", "asuser",
+			strconv.Itoa(uid)}, flag, entry, path); err2 == nil {
+			return nil
+		}
+	}
+
+	return describeACLFailure(path, user, flag, err, string(out))
+}
+
+// runChmod is the seam these are tested through.
+//
+// A test that really set an access-control entry on /Applications would be
+// changing the machine it runs on, and one that only read the source could
+// not tell a call that is made from a call that is written down and never
+// reached — which is the difference that matters here.
+var runChmod = func(ctx context.Context, prefix []string, args ...string) ([]byte, error) {
+	cmd := append(append([]string{}, prefix...), "/bin/chmod")
+	cmd = append(cmd, args...)
+	if len(prefix) == 0 {
+		cmd = append([]string{"/bin/chmod"}, args...)
+	}
+	return exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput()
+}
+
+// consoleUIDFn is the seam for who is at the screen.
+var consoleUIDFn = consoleUID
+
+// consoleUID is the uid of whoever is at the screen, or 0.
+func consoleUID() int {
+	fi, err := os.Stat("/dev/console")
+	if err != nil {
+		return 0
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+	return int(st.Uid)
+}
+
+// describeACLFailure turns a bare errno into something somebody can act on.
+//
+// "operation not permitted" on /Applications, as root, is not SIP — the
+// directory carries no restricted flag and is absent from rootless.conf.
+// Nobody reading the errno would guess what it is, and the fix is not
+// anything in this product.
+func describeACLFailure(path, user, flag string, err error, out string) error {
+	detail := strings.TrimSpace(out)
+	if strings.Contains(detail, "Operation not permitted") || errors.Is(err, syscall.EPERM) {
+		return fmt.Errorf("macOS refused an access-control entry on %s, from a "+
+			"background service and from the user's own session. Granting the "+
+			"agent App Management does not change this — it was tried. Until "+
+			"something does, this Mac installs, updates and removes approved "+
+			"software through the agent's menu bar item instead, and dragging "+
+			"applications in or out of Applications will keep asking for an "+
+			"administrator password: %w", path, err)
+	}
+	return fmt.Errorf("%s %s on %s: %w: %s", flag, user, path, err, detail)
 }
 
 // aclListing is `ls -lde` output for one path, or empty.
