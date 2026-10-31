@@ -77,9 +77,28 @@ func InstallBundle(src string) error {
 	_ = os.RemoveAll(staging)
 	defer os.RemoveAll(staging)
 
-	if err := copyTree(ctx, src, staging); err != nil {
+	// Watched while it runs, so somebody can see it moving.
+	//
+	// The staging directory is what is measured, not the destination: the
+	// destination does not exist until the rename at the end, so a bar
+	// watching it would sit at zero for the whole copy and then jump to
+	// done — which is exactly the shape of a hang.
+	watchCtx, stopWatching := context.WithCancel(ctx)
+	go watchCopy(watchCtx, src, staging, "Copying "+strings.TrimSuffix(name, ".app"))
+
+	err := copyTree(ctx, src, staging)
+	stopWatching()
+	if err != nil {
 		return fmt.Errorf("copying %s: %w", name, err)
 	}
+
+	// The last word is the full size, not whatever the final tick caught.
+	//
+	// Without it the bar stops wherever the 200ms sampling happened to land
+	// — 94%, 98% — and stays there while the rename and the cleanup run.
+	// Finishing at a number below 100 reads as an install that gave up.
+	full := treeSize(src)
+	report(Progress{Phase: "Finishing", Done: full, Total: full})
 
 	// The old copy goes out of the way first, and is only deleted once the
 	// new one is in place — so a failed rename leaves the old application
@@ -127,6 +146,7 @@ func InstallMounted(app MountedApp) error {
 	// and the decision is minutes old; between the two, this is the one
 	// instant that matters, because what follows runs as root.
 	if verifiedPackageSigner(app.BundlePath) == "" {
+		//nolint:lll // the sentence reads better whole
 		return fmt.Errorf("%s is not signed by anyone this Mac trusts, "+
 			"and an installer package runs with full privilege",
 			filepath.Base(app.BundlePath))

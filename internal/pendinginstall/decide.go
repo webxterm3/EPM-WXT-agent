@@ -163,17 +163,27 @@ func DecideMounted(app MountedApp, eff *apppolicy.Effective) MountedDecision {
 	}
 
 	switch {
-	case verdict.Action == apppolicy.ActionBlock:
-		d.Outcome = OutcomeBlocked
-		// Said plainly, and without the mechanics.
+	case blockedByRule:
+		// A RULE forbids it — not a catch-all, and not the absence of one.
 		//
-		// The person reading this is standing at the Mac. They cannot change
-		// a policy rule and have no use for being told that an approval
-		// would not override one — that is the approver's problem, and the
-		// portal is where it is explained, to somebody who can act on it.
-		// Here it only reads as the machine arguing.
+		// The distinction is the whole of this branch. A default-deny estate
+		// answers "block" for everything nobody has written a rule about,
+		// and that case has to stay askable: it is the ordinary one, and the
+		// person asking is the first to raise the question at all. Only a
+		// rule is somebody having already decided.
+		d.Outcome = OutcomeBlocked
+		// Said plainly, and the dead end said too.
+		//
+		// This used to stop at the first sentence, on the reasoning that
+		// somebody standing at a Mac cannot change a policy rule and has no
+		// use for the mechanics. That held while a request still went. Now
+		// that none does, silence is worse than the mechanics: they would
+		// wait for an approval that is never coming, and the machine would
+		// have decided what they were allowed to know.
 		d.Reason = "Your organisation does not allow " + app.Name +
-			" to be installed on this Mac."
+			" to be installed on this Mac. No approval request has been " +
+			"raised: an approver cannot override a policy rule. Ask whoever " +
+			"manages your Mac to change the rule."
 
 	case app.Publisher == "":
 		// Without a verified signature the only identity this has is the
@@ -191,8 +201,16 @@ func DecideMounted(app MountedApp, eff *apppolicy.Effective) MountedDecision {
 			"so there is nothing to confirm it is really what it claims to be."
 
 	case !verdict.FromRule:
-		// A catch-all allow means "nobody has thought about this one", which
-		// is not permission to put it on the machine without a password.
+		// A catch-all — allow OR deny — means "nobody has thought about this
+		// one". Neither is permission to put it on the machine without a
+		// password, and both are worth asking about.
+		//
+		// The deny half reaches here only because the branch above now tests
+		// blockedByRule rather than the action alone. Before that it was
+		// swallowed as "blocked", which was accurate and useless: in a
+		// default-deny estate that is nearly every application, and calling
+		// it a block made an unwritten rule look like a decision somebody
+		// had taken.
 		d.Outcome = OutcomeNoPolicy
 		d.Reason = "No policy rule covers " + app.Name + ", so it has not been approved."
 
@@ -227,16 +245,42 @@ func DecideMounted(app MountedApp, eff *apppolicy.Effective) MountedDecision {
 
 // Requestable reports whether an approver could change this answer.
 //
-// Blocked and not-covered both can: one is a rule saying no, the other is
-// nobody having decided, and in a default-deny estate the second is the
-// common case — most software nobody has written a rule about. Somebody who
-// needs it has to be able to ask, or a default-deny policy means filing a
-// ticket by hand for every application anybody has ever needed.
+// ONLY not-covered. Nobody has decided about this software, so asking is
+// exactly the right move — and in a default-deny estate that is the common
+// case, most software having no rule written about it. Without this a
+// default-deny policy would mean filing a ticket by hand for every
+// application anybody has ever needed.
+//
+// Blocked cannot, and this is the part that changed. A block is an
+// administrator having already answered this question for the whole estate.
+// Raising a request against one asked somebody to overturn a standing
+// decision from a menu on somebody else's Mac — and the portal refuses to
+// approve such a request anyway, so every one of them was a dead letter: the
+// person was told it had been sent, an approver saw a row they were not
+// allowed to say yes to, and the answer never changed. The agent now says so
+// at the Mac, which is the one place the person can read it.
+//
+// This rests on a BLOCK BY RULE and a default-deny catch-all being DIFFERENT
+// outcomes — see DecideMounted. They used to be the same one, and if they
+// are ever merged again this predicate silently kills the approval route for
+// every default-deny estate.
 //
 // Unverified cannot. The problem there is the signature, and an administrator
 // saying yes would not change it — the bundle would still be something the
 // operating system cannot vouch for, and approving it would mean approving
 // whatever happened to be in the image.
-func (o Outcome) Requestable() bool {
-	return o == OutcomeBlocked || o == OutcomeNoPolicy
-}
+func (o Outcome) Requestable() bool { return o == OutcomeNoPolicy }
+
+// BlockedByPolicy reports that a policy RULE forbids this software.
+//
+// Shared for the same reason Requestable is. Both the menu bar and the agent
+// have to word and log this case differently from every other refusal — and
+// the moment either of them writes `== OutcomeBlocked` for itself, there are
+// two lists again, which is the drift that once had somebody told their
+// request had been sent when nothing had been sent at all.
+//
+// Not the same question as "not requestable": an unverified bundle is also
+// not requestable, and saying "your organisation does not allow this" about
+// a signature problem sends somebody to argue with an administrator who has
+// never heard of the application.
+func (o Outcome) BlockedByPolicy() bool { return o == OutcomeBlocked }

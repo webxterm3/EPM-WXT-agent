@@ -282,8 +282,62 @@ func TestSoftwareNobodyHasDecidedAboutCanStillBeAskedFor(t *testing.T) {
 		t.Error("software no rule covers cannot be asked about — in a default-deny " +
 			"estate that is most of it")
 	}
-	if !OutcomeBlocked.Requestable() {
-		t.Error("blocked software cannot be asked about, which is the whole point of asking")
+}
+
+// A rule is an administrator having already answered this for the whole
+// estate, and the portal refuses to approve an exception to one. A request
+// raised against it was a dead letter: the person was told it had been sent,
+// an approver saw a row they could not say yes to, and the answer never
+// changed. The agent says so at the Mac instead.
+func TestSoftwareARuleForbidsIsNotAskedAbout(t *testing.T) {
+	if OutcomeBlocked.Requestable() {
+		t.Error("a rule block offered an approval route; the portal will not " +
+			"approve one, so the request can never be redeemed")
+	}
+	if !OutcomeBlocked.BlockedByPolicy() {
+		t.Error("a rule block is not reported as blocked by policy, so nothing " +
+			"can word it differently from a missing signature")
+	}
+	// The two refusals must stay distinguishable. Telling somebody their
+	// organisation forbids an application, when the real problem is that it
+	// is unsigned, sends them to argue with an administrator who has never
+	// heard of it.
+	if OutcomeUnverified.BlockedByPolicy() {
+		t.Error("an unsigned bundle is reported as blocked by policy")
+	}
+}
+
+// THE trap in making a block unaskable.
+//
+// A default-deny estate evaluates to "block" for everything nobody has
+// written a rule about — which is nearly every application. Both kinds of
+// block produced OutcomeBlocked once, and if they are ever merged again this
+// is what breaks: every default-deny estate silently loses its approval
+// route, with the menu telling people to go and get a rule changed that
+// nobody ever wrote.
+func TestADefaultDenyCatchAllIsStillSomethingYouCanAskAbout(t *testing.T) {
+	signed := MountedApp{
+		Volume: "/Volumes/Slack", BundlePath: "/Volumes/Slack/Slack.app",
+		Name: "Slack", Publisher: "Developer ID Application: Slack Technologies",
+	}
+
+	denyAll := &apppolicy.Effective{
+		Mode: apppolicy.ModeEnforce, DefaultAction: apppolicy.ActionBlock,
+	}
+	d := DecideMounted(signed, denyAll)
+
+	if d.Outcome.BlockedByPolicy() {
+		t.Fatal("a default-deny catch-all was reported as a rule block; nobody " +
+			"wrote a rule about this application, so there is nothing to go and change")
+	}
+	if !d.Outcome.Requestable() {
+		t.Fatal("software in a default-deny estate could not be asked about — " +
+			"that is nearly every application, and the approval route is gone")
+	}
+
+	// And the explicit rule, for contrast, from the same starting point.
+	if !DecideMounted(signed, blockByName("Slack")).Outcome.BlockedByPolicy() {
+		t.Fatal("an explicit block rule was not reported as a rule block")
 	}
 }
 

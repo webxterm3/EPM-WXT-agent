@@ -1,5 +1,7 @@
 package main
 
+import "github.com/Yesveer/wxt-agent/internal/agentstatus"
+
 // Grouping the menu by application rather than by row.
 //
 // The agent publishes one row per THING it knows about: a mounted disk image
@@ -22,6 +24,14 @@ type appMenu struct {
 	actions []appAction
 }
 
+// The stages the agent publishes. Mirrored from agentstatus rather than
+// imported as strings at each use, so a typo is a compile error here rather
+// than a row that silently never matches.
+const (
+	stageChecking   = agentstatus.StageChecking
+	stageInstalling = agentstatus.StageInstalling
+)
+
 // appAction is one line inside an application's submenu. index points back
 // into the published rows, so a click still means exactly one of them.
 type appAction struct {
@@ -34,6 +44,28 @@ type appAction struct {
 // statement.
 func actionFor(r softwareRow) (label string, enabled bool) {
 	switch {
+	// Work in progress comes FIRST, before any of the offers.
+	//
+	// Not last, and not folded into them. While the agent is copying, the
+	// row is still installable and `installable` is still true — so every
+	// branch below would go on offering "Install" for the whole length of
+	// the copy, which is exactly what made somebody click it twice.
+	case r.stage == stageInstalling:
+		// "Updating" where there is something to replace. Somebody watching
+		// their existing copy be swapped out should see that word and not
+		// one that suggests a second copy is being added.
+		if r.updates {
+			return "Updating…", false
+		}
+		return "Installing…", false
+
+	case r.stage == stageChecking:
+		// The image is mounted and the answer is not settled. Deliberately
+		// a few seconds: the agent will not judge a half-mounted bundle.
+		// Saying so is the difference between a Mac that is working on it
+		// and a Mac that ignored the double-click.
+		return "Checking…", false
+
 	case r.installed && r.removable:
 		return "Remove", true
 	case r.installable && r.updates:
@@ -46,9 +78,18 @@ func actionFor(r softwareRow) (label string, enabled bool) {
 		return "Approval requested", false
 	case r.requestable:
 		return "Request approval", true
+	case r.blocked:
+		// A statement, and the end of the road.
+		//
+		// No approval route, because a rule has already answered this for
+		// the whole organisation and the portal will not let anybody
+		// overturn it from here. The note above the actions says what to do
+		// instead, which is to get the rule changed.
+		return "Blocked by your organisation", false
 	default:
-		// Unverified. Not offered an approval route, because the signature
-		// is what is missing and no approval supplies one.
+		// Unverified. Not offered an approval route either, but for an
+		// entirely different reason: the signature is what is missing, and
+		// no approval supplies one.
 		return "Cannot be verified", false
 	}
 }

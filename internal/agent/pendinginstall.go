@@ -108,6 +108,15 @@ type pendingInstallState struct {
 	// confirmed, so the loop looks again soon rather than at the next
 	// three-second tick.
 	unsettled bool
+
+	// installing is which volumes the agent is copying or running RIGHT
+	// NOW, so the menu can say so instead of looking like it ignored the
+	// click.
+	//
+	// Keyed on the volume, like everything else here, and not on the
+	// application name: the same application can be mounted from two images
+	// at once, and the one being installed is the one somebody clicked.
+	installing map[string]bool
 }
 
 // refusedInstall is one closed image, when it was closed, and whether the
@@ -134,13 +143,18 @@ func (a *Agent) pendingInstallLoop(ctx context.Context) {
 	if err := agentstatus.PrepareInstallResult(); err != nil {
 		a.logger.Warn("The menu bar will not be told how installs went", zap.Error(err))
 	}
+	if err := agentstatus.PrepareInstallProgress(); err != nil {
+		a.logger.Warn("The menu bar will show a progress bar that does not move",
+			zap.Error(err))
+	}
 
 	state := &pendingInstallState{
-		mounted:   map[string]pendinginstall.MountedDecision{},
-		refused:   map[string]refusedInstall{},
-		ejecting:  map[string]bool{},
-		settling:  map[string]pendinginstall.Outcome{},
-		confirmed: map[string]bool{},
+		mounted:    map[string]pendinginstall.MountedDecision{},
+		refused:    map[string]refusedInstall{},
+		ejecting:   map[string]bool{},
+		settling:   map[string]pendinginstall.Outcome{},
+		confirmed:  map[string]bool{},
+		installing: map[string]bool{},
 	}
 
 	scan := time.NewTicker(scanInterval)
@@ -351,10 +365,19 @@ func (a *Agent) rescanVolumes(state *pendingInstallState) {
 			// goes out every time they try, which is what somebody expects
 			// after their first attempt went nowhere.
 			//
-			// Requestable(), so an unverified bundle raises nothing. The
-			// signature is what is missing, and no approval can supply it —
-			// asking anyway puts a request in front of somebody that cannot
-			// be redeemed whatever they decide.
+			// Requestable(), so neither an unverified bundle nor software a
+			// RULE forbids raises anything.
+			//
+			// Both would put a request in front of an approver that cannot
+			// be redeemed whatever they decide — for the unverified one
+			// because no approval supplies a signature, and for the blocked
+			// one because the portal refuses to approve an exception to a
+			// rule. The menu bar says so at the Mac instead, to the person
+			// who can act on it by going and asking for the rule to change.
+			//
+			// A default-deny catch-all is NOT a rule and does reach here;
+			// that is the ordinary case in such an estate and the one the
+			// approval route exists for.
 			//
 			// It cannot flood an approver: the backend keeps one pending
 			// request per machine per application and drops repeats.
@@ -374,6 +397,9 @@ func (a *Agent) rescanVolumes(state *pendingInstallState) {
 		if _, stillMounted := next[volume]; !stillMounted {
 			delete(state.settling, volume)
 			delete(state.confirmed, volume)
+			// Or a crash mid-copy would leave the menu saying "Installing…"
+			// about an image nobody can see, for as long as the agent runs.
+			delete(state.installing, volume)
 		}
 	}
 	state.unsettled = unsettled
@@ -705,7 +731,7 @@ func (a *Agent) closeRefusedImage(state *pendingInstallState, volume string) {
 // publishMounted writes what is mounted and what policy says, for the menu
 // bar. Caller holds state.mu.
 func (a *Agent) publishMounted(state *pendingInstallState) {
-	row := func(d pendinginstall.MountedDecision, closed, requested bool) agentstatus.PendingInstall {
+	row := func(d pendinginstall.MountedDecision, closed, requested bool, stage string) agentstatus.PendingInstall {
 		// "pkg" or "app": a package is run, a bundle is copied, and the
 		// two fail in different ways. Reporting both as "app" would make a
 		// package's install failure unreadable in the portal.
@@ -724,6 +750,7 @@ func (a *Agent) publishMounted(state *pendingInstallState) {
 			Policy:    d.Policy,
 			Closed:    closed,
 			Requested: requested,
+			Stage:     stage,
 			// Replacing a version that is already there is an UPDATE, and
 			// somebody about to do it is entitled to know that is what it
 			// is. Called "install" either way, replacing the application
@@ -746,6 +773,27 @@ func (a *Agent) publishMounted(state *pendingInstallState) {
 		// first look can read an empty bundle identifier, and a rule that
 		// matches on one then does not match.
 		if !state.confirmed[volume] {
+			// Shown, but with no answer attached.
+			//
+			// Skipping these entirely is what this did, and the reason was
+			// sound: a provisional answer put "needs approval" in front of
+			// somebody for software an operator had allowed. But the two
+			// scans that settle it take seconds, and for those seconds the
+			// menu said nothing at all — so double-clicking a disk image
+			// looked like it had done nothing, which is the complaint this
+			// whole feature exists to answer.
+			//
+			// A checking row carries the NAME and nothing else: no outcome,
+			// no reason, no rule. There is nothing to misread because there
+			// is nothing there yet.
+			if d.Own {
+				continue
+			}
+			out = append(out, agentstatus.PendingInstall{
+				Path:  d.App.BundlePath,
+				Label: d.App.Name,
+				Stage: agentstatus.StageChecking,
+			})
 			continue
 		}
 		// Our own installer is not offered. It is allowed, so that upgrading
@@ -763,7 +811,11 @@ func (a *Agent) publishMounted(state *pendingInstallState) {
 		// somebody who had already raised a request, had the image ejected,
 		// and opened it again was asked the same question from the start —
 		// every time, for software already sitting in an approver's queue.
-		out = append(out, row(d, false, state.refused[volume].requested))
+		stage := ""
+		if state.installing[volume] {
+			stage = agentstatus.StageInstalling
+		}
+		out = append(out, row(d, false, state.refused[volume].requested, stage))
 	}
 	// Images the agent has closed are published too, so the person can
 	// still ask about software whose window it took away. One that is
@@ -772,7 +824,7 @@ func (a *Agent) publishMounted(state *pendingInstallState) {
 		if _, stillMounted := state.mounted[volume]; stillMounted {
 			continue
 		}
-		out = append(out, row(r.decision, true, r.requested))
+		out = append(out, row(r.decision, true, r.requested, ""))
 	}
 	out = append(out, a.installedRows()...)
 	a.pendingInstalls.Store(&out)
@@ -966,7 +1018,16 @@ func (a *Agent) requestApproval(volume string, state *pendingInstallState) {
 	// which needs no privacy grant, no configuration profile, and leaves no
 	// standing permission behind.
 	if d.Outcome == pendinginstall.OutcomeInstallable {
+		// Said BEFORE the copy starts, not after it finishes.
+		//
+		// A copy into /Applications runs for seconds on a small application
+		// and a minute on a large one, and until now the menu went on
+		// offering "Install" for the whole of it. Somebody who clicked,
+		// looked again and saw the same offer concluded the click had not
+		// registered — and clicked it a second time.
+		a.markInstalling(state, volume, true)
 		a.installApproved(d)
+		a.markInstalling(state, volume, false)
 		return
 	}
 
@@ -977,6 +1038,18 @@ func (a *Agent) requestApproval(volume string, state *pendingInstallState) {
 	// bar had already said the request was sent, so the person was told it
 	// had worked and no trace of it existed anywhere.
 	if !d.Outcome.Requestable() {
+		if d.Outcome.BlockedByPolicy() {
+			// Logged as its own thing. "Nothing to do" is what this said
+			// for every non-requestable outcome, and a rule block is the
+			// one an administrator reading the log will come looking for —
+			// it is the answer to "why did nobody get my request".
+			a.logger.Info("Blocked by a policy rule, so no approval was requested",
+				zap.String("application", d.App.Name),
+				zap.String("rule", d.Rule),
+				zap.String("policy", d.Policy),
+				zap.String("user", pendinginstall.ConsoleUser()))
+			return
+		}
 		a.logger.Info("Nothing to do for this image",
 			zap.String("application", d.App.Name),
 			zap.String("outcome", string(d.Outcome)))
@@ -1041,9 +1114,53 @@ func sameVolumes(a, b []string) bool {
 	return true
 }
 
+// markInstalling records that a copy is running, and republishes so the menu
+// says so within a tick.
+//
+// Taken and released around the publish rather than held across the install:
+// the scan loop needs this lock every three seconds, and holding it for the
+// length of a copy would stop the agent noticing anything else — including
+// the image being ejected underneath it.
+func (a *Agent) markInstalling(state *pendingInstallState, volume string, busy bool) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if busy {
+		state.installing[volume] = true
+	} else {
+		delete(state.installing, volume)
+	}
+	a.publishMounted(state)
+}
+
+// reportProgressFor connects the install's own account of itself to the file
+// the menu bar reads, for the length of one install.
+//
+// Set up and torn down around each install rather than once at startup, so
+// the application name on every report is the one being installed — and so
+// that nothing is left reporting into a channel after the work has stopped.
+func reportProgressFor(name string) func() {
+	pendinginstall.SetProgressSink(func(p pendinginstall.Progress) {
+		agentstatus.ReportInstallProgress(agentstatus.InstallProgress{
+			Application: name,
+			Phase:       p.Phase,
+			Done:        p.Done,
+			Total:       p.Total,
+		})
+	})
+	return func() {
+		pendinginstall.SetProgressSink(nil)
+		// Cleared, not left at 100%. A finished line sitting in the file
+		// would be drawn under the name of whatever is installed next, for
+		// the moment before its first real report arrives.
+		agentstatus.ClearInstallProgress()
+	}
+}
+
 // installApproved puts an approved application into /Applications.
 func (a *Agent) installApproved(d pendinginstall.MountedDecision) {
+	done := reportProgressFor(d.App.Name)
 	err := pendinginstall.InstallMounted(d.App)
+	done()
 	if err != nil {
 		a.logger.Error("Could not install approved software",
 			zap.String("application", d.App.Name), zap.Error(err))

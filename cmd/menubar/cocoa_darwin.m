@@ -370,3 +370,133 @@ int wxt_confirm(const char *title, const char *body, const char *okTitle,
 		return ([alert runModal] == NSAlertFirstButtonReturn) ? 1 : 0;
 	}
 }
+
+// A small floating panel that says work is happening.
+//
+// Why a panel and not an NSAlert: an alert is modal, and the whole point here
+// is to show something DURING an operation rather than instead of it. A modal
+// alert would have to be dismissed before the install could start.
+//
+// Indeterminate, and that is not laziness. The agent installs by handing the
+// bundle to `ditto`, which reports nothing at all until it is finished — so a
+// percentage here would be a number this code invented. A bar that moves
+// because time is passing, next to a name, says the true thing: something is
+// running and it is this.
+static NSPanel *g_progressPanel = nil;
+static NSTextField *g_progressLabel = nil;
+static NSProgressIndicator *g_progressBar = nil;
+
+void wxt_progress_show(const char *title, const char *body) {
+	@autoreleasepool {
+		NSString *t = [NSString stringWithUTF8String:title];
+		NSString *b = [NSString stringWithUTF8String:body];
+
+		if (g_progressPanel == nil) {
+			NSRect frame = NSMakeRect(0, 0, 380, 104);
+			g_progressPanel = [[NSPanel alloc]
+				initWithContentRect:frame
+				          styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskUtilityWindow
+				            backing:NSBackingStoreBuffered
+				              defer:NO];
+			// No close button: there is nothing a person could do by
+			// dismissing it except lose sight of what is running. It goes
+			// away by itself when the work finishes.
+			[[g_progressPanel standardWindowButton:NSWindowCloseButton] setHidden:YES];
+			g_progressPanel.floatingPanel = YES;
+			g_progressPanel.hidesOnDeactivate = NO;
+			g_progressPanel.level = NSFloatingWindowLevel;
+
+			g_progressLabel = [[NSTextField alloc]
+				initWithFrame:NSMakeRect(20, 52, 340, 20)];
+			g_progressLabel.bezeled = NO;
+			g_progressLabel.drawsBackground = NO;
+			g_progressLabel.editable = NO;
+			g_progressLabel.selectable = NO;
+			[g_progressPanel.contentView addSubview:g_progressLabel];
+
+			g_progressBar = [[NSProgressIndicator alloc]
+				initWithFrame:NSMakeRect(20, 26, 340, 16)];
+			g_progressBar.style = NSProgressIndicatorStyleBar;
+			g_progressBar.indeterminate = YES;
+			[g_progressPanel.contentView addSubview:g_progressBar];
+		}
+
+		g_progressPanel.title = t;
+		g_progressLabel.stringValue = b;
+		[g_progressBar startAnimation:nil];
+		[g_progressPanel center];
+		[g_progressPanel orderFrontRegardless];
+	}
+}
+
+void wxt_progress_hide(void) {
+	@autoreleasepool {
+		if (g_progressPanel == nil) return;
+		[g_progressBar stopAnimation:nil];
+		[g_progressPanel orderOut:nil];
+	}
+}
+
+// Let the run loop breathe for a moment.
+//
+// The menu bar's work happens on the main thread, so a Go function that
+// sleeps while waiting for the agent freezes every pixel this process owns —
+// including the progress bar it just put on screen, which would sit
+// motionless for the whole install and say the opposite of what it is for.
+//
+// Draining events instead of sleeping keeps the animation running and the
+// panel redrawing. Bounded by a date, so it always returns.
+void wxt_pump(double seconds) {
+	@autoreleasepool {
+		NSDate *until = [NSDate dateWithTimeIntervalSinceNow:seconds];
+		while ([until timeIntervalSinceNow] > 0) {
+			NSEvent *e = [NSApp nextEventMatchingMask:NSEventMaskAny
+			                                untilDate:until
+			                                   inMode:NSDefaultRunLoopMode
+			                                  dequeue:YES];
+			if (e == nil) break;
+			[NSApp sendEvent:e];
+		}
+	}
+}
+
+// Move the bar to a real position, or back to "something is happening".
+//
+// percent < 0 means the work cannot be measured, and the bar goes back to
+// sweeping. That is not a fallback nobody hits: a package prints nothing at
+// all for its first seconds, and a bar sitting frozen at 0% during those
+// seconds says "stuck" where an indeterminate one says "starting".
+void wxt_progress_update(double percent, const char *body) {
+	@autoreleasepool {
+		if (g_progressPanel == nil) return;
+		if (body != NULL) {
+			g_progressLabel.stringValue = [NSString stringWithUTF8String:body];
+		}
+
+		if (percent < 0) {
+			if (!g_progressBar.indeterminate) {
+				g_progressBar.indeterminate = YES;
+				[g_progressBar startAnimation:nil];
+			}
+			return;
+		}
+
+		if (g_progressBar.indeterminate) {
+			// stopAnimation before switching: an indeterminate bar left
+			// animating draws its sweep over the determinate fill.
+			[g_progressBar stopAnimation:nil];
+			g_progressBar.indeterminate = NO;
+			g_progressBar.minValue = 0;
+			g_progressBar.maxValue = 100;
+		}
+		g_progressBar.doubleValue = percent;
+
+		// Redrawn here, not left to the next natural pass.
+		//
+		// The caller is a Go loop that drains events and comes straight
+		// back; between those drains nothing asks this view to draw, so
+		// without this the bar holds its old position until something else
+		// happens to dirty the window.
+		[g_progressBar display];
+	}
+}

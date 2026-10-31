@@ -10,7 +10,10 @@ package main
 */
 import "C"
 
-import "unsafe"
+import (
+	"time"
+	"unsafe"
+)
 
 //export wxtMenuLogs
 func wxtMenuLogs() { openLogs() }
@@ -91,10 +94,43 @@ func refreshSoftwareMenu() {
 	// thing to look at.
 	C.wxt_software_end(C.int(len(apps)))
 
+	// Before the dialog, because the two share one panel and the dialog
+	// takes it down.
+	showCheckingPanel(items)
+
 	// After the menu is rebuilt, not before: if somebody says no to the
 	// dialog, the row is already there for them to come back to.
 	askAboutNewInstalls(items)
 }
+
+// progressShow puts a floating panel on screen saying work is running.
+func progressShow(title, body string) {
+	cTitle := C.CString(title)
+	cBody := C.CString(body)
+	defer func() {
+		C.free(unsafe.Pointer(cTitle))
+		C.free(unsafe.Pointer(cBody))
+	}()
+	C.wxt_progress_show(cTitle, cBody)
+}
+
+func progressHide() { C.wxt_progress_hide() }
+
+// progressUpdate moves the bar. A negative percent means "not measurable",
+// which puts the bar back to sweeping rather than freezing it at zero.
+func progressUpdate(percent float64, body string) {
+	cBody := C.CString(body)
+	defer C.free(unsafe.Pointer(cBody))
+	C.wxt_progress_update(C.double(percent), cBody)
+}
+
+// pumpRunLoop waits WITHOUT freezing the interface.
+//
+// time.Sleep on this thread stops every pixel this process draws, because
+// the menu bar's work happens on the main thread — so the progress bar put
+// up a moment earlier would sit motionless for the whole install, saying the
+// exact opposite of what it is there to say.
+func pumpRunLoop(d time.Duration) { C.wxt_pump(C.double(d.Seconds())) }
 
 // showText displays a read-only, selectable block of text.
 func showText(title, body string) {

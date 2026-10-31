@@ -184,3 +184,67 @@ func TestAnOpenedImageIsAskedAboutDespiteInstalledSoftware(t *testing.T) {
 		t.Errorf("asked about %s instead of the image that was just opened", row.path)
 	}
 }
+
+// Somebody who opens a disk image for forbidden software is TOLD, there and
+// then.
+//
+// The agent no longer raises an approval request for software a policy rule
+// forbids — the portal refuses to approve one, so it was a dead letter. That
+// makes saying so the only thing left, and the menu bar is not where it gets
+// said: this person is looking at a Finder window, and what they see next is
+// the image closing itself. Left out of the prompt they conclude the Mac is
+// broken, which is the exact failure this file exists to prevent.
+func TestForbiddenSoftwareIsExplainedAtTheMacRatherThanSilentlyDropped(t *testing.T) {
+	p := newInstallPrompts()
+	row, ok := p.next([]softwareRow{{
+		name: "Claude", title: "Claude",
+		path:    "/Volumes/Claude/Claude.app",
+		blocked: true,
+		detail:  "Your organisation does not allow Claude to be installed on this Mac.",
+	}})
+	if !ok {
+		t.Fatal("nothing was said about software a rule forbids; the person " +
+			"watches the image close itself and is told nothing at all")
+	}
+	if row.name != "Claude" {
+		t.Fatalf("asked about %q", row.name)
+	}
+
+	// Once per attempt, like every other row. A modal dialog on every scan
+	// tick is not an explanation, it is a machine that has stopped
+	// responding.
+	if _, again := p.next([]softwareRow{row}); again {
+		t.Error("the same blocked application was announced twice")
+	}
+}
+
+// An unverifiable bundle is still left out. Nothing can change that answer
+// and there is nothing to do about it at the Mac, so a modal dialog is an
+// interruption that ends in no decision.
+func TestAnUnverifiableBundleIsStillNotWorthInterruptingFor(t *testing.T) {
+	p := newInstallPrompts()
+	if _, ok := p.next([]softwareRow{{
+		name: "Thing", title: "Thing", path: "/Volumes/Thing/Thing.app",
+	}}); ok {
+		t.Error("an unverifiable bundle interrupted somebody with a dialog " +
+			"offering nothing to decide")
+	}
+}
+
+// A row the agent is still working out is not a question.
+//
+// It carries no outcome, because there is not one yet. Interrupting somebody
+// with a dialog about it would be asking them to decide something nobody has
+// decided — and the wording would come from whichever branch matched an
+// empty outcome.
+func TestAnUnsettledRowIsNotTurnedIntoAQuestion(t *testing.T) {
+	p := newInstallPrompts()
+	if _, ok := p.next([]softwareRow{{
+		name: "Slack", title: "Slack",
+		path:  "/Volumes/Slack/Slack.app",
+		stage: stageChecking,
+	}}); ok {
+		t.Error("somebody was asked about software the agent had not finished " +
+			"judging; there is no answer yet to put in the dialog")
+	}
+}

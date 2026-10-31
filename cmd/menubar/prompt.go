@@ -61,11 +61,23 @@ func (p *installPrompts) next(rows []softwareRow) (softwareRow, bool) {
 			continue
 		}
 
-		// And only where clicking does something: installing approved
-		// software, or asking about software that is not approved. An
-		// unverified bundle is neither — the signature is the problem, and
-		// an administrator saying yes would not change it.
-		if !r.clickable() || r.path == "" || p.asked[r.path] {
+		// Where clicking does something — installing approved software, or
+		// asking about software nobody has ruled on — OR where there is
+		// something they have to be TOLD.
+		//
+		// Blocked is the second kind. Nothing is offered and nothing is
+		// decided, but the agent no longer raises a request for it, and
+		// somebody who has just opened a disk image is owed the reason
+		// there and then. Left out of this list they would watch the image
+		// close itself and conclude the Mac was broken — which is the exact
+		// failure this whole file exists to prevent.
+		//
+		// An unverified bundle is still left out: nothing can change that
+		// answer and there is nothing to do about it at the Mac.
+		if !r.clickable() && !r.blocked {
+			continue
+		}
+		if r.path == "" || p.asked[r.path] {
 			continue
 		}
 		// An ask that has already gone out is still worth SAYING once.

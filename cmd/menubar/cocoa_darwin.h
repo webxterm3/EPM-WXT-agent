@@ -40,6 +40,25 @@ void wxt_show_text(const char *title, const char *body);
 // could only tell them something.
 int wxt_confirm(const char *title, const char *body, const char *okTitle,
                 const char *cancelTitle);
+// A floating panel saying that something is running, with an indeterminate
+// bar. Shown DURING an operation, which is why it is a panel and not an
+// alert: an alert is modal and would have to be dismissed before the work
+// could start. Calling show again replaces the text on the panel already up.
+void wxt_progress_show(const char *title, const char *body);
+void wxt_progress_hide(void);
+
+// Move the bar. A percent below zero puts it back to indeterminate, which is
+// what honest ignorance looks like — a bar frozen at 0% reads as stuck.
+// A NULL body leaves the text alone.
+void wxt_progress_update(double percent, const char *body);
+
+// Drain events for a moment instead of sleeping.
+//
+// The menu bar runs on the main thread. A Go function that sleeps while it
+// waits for the agent freezes everything this process draws — including the
+// progress bar it just put on screen.
+void wxt_pump(double seconds);
+
 void wxt_stop(void);
 
 #endif

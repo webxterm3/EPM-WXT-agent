@@ -3,9 +3,11 @@
 package pendinginstall
 
 import (
+	"bufio"
 	"context"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -83,13 +85,98 @@ var installPackage = func(pkg string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, "/usr/sbin/installer",
-		"-pkg", pkg, "-target", "/").CombinedOutput()
+	// -verboseR, so the installer says how far along it is.
+	//
+	// It is the only honest source for a package. A package decides for
+	// itself where its payload goes and runs scripts of its own, so there
+	// is no directory to watch growing the way a bundle copy can be
+	// watched — anything measured from outside would be a guess.
+	//
+	// Measured on this platform, the lines are:
+	//
+	//	installer:PHASE:Preparing the disk…
+	//	installer:%97.750000
+	//	installer:PHASE:The software was successfully installed.
+	//
+	// Output is still collected in full, because when this fails the whole
+	// of it is the only explanation anybody gets.
+	cmd := exec.CommandContext(ctx, "/usr/sbin/installer",
+		"-verboseR", "-pkg", pkg, "-target", "/")
+
+	out, err := runWithProgress(cmd)
 	if err != nil {
-		return &installerError{pkg: pkg, detail: strings.TrimSpace(string(out)), err: err}
+		return &installerError{pkg: pkg, detail: strings.TrimSpace(out), err: err}
 	}
 	return nil
 }
+
+// installerPercent and installerPhase are what -verboseR prints.
+var (
+	installerPercent = regexp.MustCompile(`^installer:%([0-9.]+)`)
+	installerPhase   = regexp.MustCompile(`^installer:PHASE:(.+)$`)
+)
+
+// runWithProgress runs the installer, reporting each percentage it prints
+// and returning everything it said.
+//
+// Percentages are scaled to a fixed 10000 rather than reported as a float,
+// because the channel to the menu bar carries two integers — done out of
+// total — and that is the shape a copy needs. A package is simply a copy
+// whose total is a constant.
+func runWithProgress(cmd *exec.Cmd) (string, error) {
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	cmd.Stderr = cmd.Stdout
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+
+	// Carried between lines, and LOCAL to this run.
+	//
+	// A phase line arrives without a percentage and a percentage without a
+	// phase, so each has to keep what the other last said — otherwise the
+	// bar drops to zero every time the words change. Package-level would
+	// have been one line shorter and would have started the next install
+	// at the previous one's percentage.
+	var (
+		lastPhase   string
+		lastPercent int64
+	)
+
+	var collected strings.Builder
+	scanner := bufio.NewScanner(pipe)
+	for scanner.Scan() {
+		line := scanner.Text()
+		collected.WriteString(line)
+		collected.WriteString("\n")
+
+		if m := installerPhase.FindStringSubmatch(line); m != nil {
+			lastPhase = strings.TrimSpace(m[1])
+			// A phase with no percentage yet still moves the words, which
+			// is what the early part of a package install consists of.
+			report(Progress{Phase: lastPhase, Done: lastPercent, Total: percentScale})
+			continue
+		}
+		if m := installerPercent.FindStringSubmatch(line); m != nil {
+			if v, convErr := strconv.ParseFloat(m[1], 64); convErr == nil {
+				lastPercent = int64(v / 100 * percentScale)
+				report(Progress{Phase: lastPhase, Done: lastPercent, Total: percentScale})
+			}
+		}
+	}
+
+	waitErr := cmd.Wait()
+	return collected.String(), waitErr
+}
+
+// percentScale is what a package's progress is counted out of.
+//
+// The channel to the menu bar carries two integers, done out of total,
+// because that is the shape a file copy has. A package reports a percentage
+// instead, so it is expressed as a fraction of a constant.
+const percentScale = 10000
 
 type installerError struct {
 	pkg    string

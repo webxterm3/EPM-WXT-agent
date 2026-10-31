@@ -42,6 +42,16 @@ type softwareRow struct {
 	// installable rows are the ones the agent will put into /Applications
 	// when asked. Clicking one installs it; there is nothing to approve.
 	installable bool
+	// stage is what the agent is doing about this row right now, as
+	// opposed to what it decided. Empty for a settled row.
+	stage string
+	// blocked marks software a POLICY RULE forbids.
+	//
+	// Separate from "not requestable", although a blocked row is both. The
+	// menu has to say which of the two it is: "cannot be verified" on an
+	// application the organisation has deliberately forbidden sends somebody
+	// looking for a signature problem that does not exist.
+	blocked bool
 	// requested reports that the approval has already been asked for, so
 	// the row and the dialog say so rather than offering to ask again.
 	requested bool
@@ -114,6 +124,7 @@ func rowFor(p agentstatus.PendingInstall) softwareRow {
 	// agent still tested for "blocked" and dropped the rest. Nothing failed:
 	// the dialog said the request had been made, and it had not.
 	requestable := pendinginstall.Outcome(p.Outcome).Requestable()
+	blocked := pendinginstall.Outcome(p.Outcome).BlockedByPolicy()
 
 	row := softwareRow{
 		name:        label,
@@ -121,6 +132,8 @@ func rowFor(p agentstatus.PendingInstall) softwareRow {
 		detail:      p.Reason,
 		path:        p.Path,
 		requestable: requestable,
+		blocked:     blocked,
+		stage:       p.Stage,
 		closed:      p.Closed,
 		requested:   p.Requested,
 		canDrag:     p.CanDrag,
@@ -257,6 +270,39 @@ func installNow(row softwareRow) {
 	if row.path == "" {
 		return
 	}
+
+	// Something on screen for the whole of it.
+	//
+	// The copy runs for seconds on a small application and a minute on a
+	// large one, and until now the dialog closed the moment somebody
+	// clicked Install and nothing replaced it. From where they were sitting
+	// the click did nothing, and the application appeared — or did not —
+	// some time later with no way to tell which was happening.
+	// Three words for the one operation, because a dialog that says
+	// "Installed" about a version somebody has just REPLACED reads as a
+	// second copy having appeared beside the one they were using.
+	name := appNameOf(row)
+	running, done, verb := "Installing", "Updated", "update"
+	if !row.updates {
+		done, verb = "Installed", "install"
+	} else {
+		running = "Updating"
+	}
+	progressShow(running+" "+name, "This will not ask you for a password.")
+	defer progressHide()
+
+	// Nothing else may open a window while this one is up.
+	//
+	// pumpRunLoop below keeps the run loop turning so the bar animates,
+	// which also lets the refresh timer fire — and that timer can decide to
+	// put up a dialog of its own. Without this, somebody installing from
+	// the menu could be asked about a different disk image on top of their
+	// own install. Restored rather than cleared, because the caller may
+	// already hold it.
+	wasAsking := askingNow
+	askingNow = true
+	defer func() { askingNow = wasAsking }()
+
 	if err := agentstatus.RequestInstall(row.path); err != nil {
 		showText("Could not install",
 			fmt.Sprintf("The request could not be written:\n\n%v\n\n"+
@@ -264,19 +310,22 @@ func installNow(row softwareRow) {
 		return
 	}
 
-	name := appNameOf(row)
 	if problem, ok := waitForInstall(); ok {
+		// Hidden before the result dialog, not after: an alert on top of a
+		// still-spinning progress bar reads as two things happening.
+		progressHide()
 		if problem == "" {
-			showText("Installed", name+" is now in your Applications folder.")
+			showText(done, name+" is ready to use.")
 		} else {
-			showText("Could not install", name+" was not installed.\n\n"+problem)
+			showText("Could not "+verb+" "+name, problem)
 		}
 		return
 	}
-	showText("Installing",
-		name+" is being installed. It will appear in your Applications "+
-			"folder shortly.\n\nYou were not asked for a password because "+
-			"this Mac installs approved software for you.")
+	progressHide()
+	showText(running+" "+name,
+		name+" is still being "+verb+"d, and will finish by itself.\n\n"+
+			"You were not asked for a password because this Mac "+verb+"s "+
+			"approved software for you.")
 }
 
 // waitForInstall gives the agent a few seconds to answer.
@@ -286,19 +335,118 @@ func installNow(row softwareRow) {
 // at all — in which case no answer is ever coming and the dialog would never
 // close.
 func waitForInstall() (problem string, answered bool) {
-	for i := 0; i < installWaitTicks; i++ {
+	// Two different waits, because there are two different silences.
+	//
+	// Silence at the START means nobody picked the request up: the agent is
+	// not running, or it refused the path. Nothing is ever coming, and a
+	// progress panel sitting there for twenty minutes would be the longest
+	// possible way to say so.
+	//
+	// Silence LATER, after progress has been seen, means a copy is running
+	// and simply has not finished. Giving up on that would take the bar off
+	// the screen a few percent into every large application — the moment
+	// somebody most wants to look at it.
+	//
+	// So the budget starts short and is extended the first time the agent
+	// actually says something.
+	budget := startWaitTicks
+	started := false
+
+	for i := 0; i < budget; i++ {
 		if app, problem := agentstatus.TakeInstallResult(); app != "" {
 			return problem, true
 		}
-		time.Sleep(installWaitTick)
+
+		// The bar is moved on every tick of this loop, which is the only
+		// place in this process that is awake while an install runs.
+		if drawInstallProgress() && !started {
+			started = true
+			budget = installWaitTicks
+		}
+
+		// Not time.Sleep. See pumpRunLoop: sleeping here freezes the
+		// progress bar this wait exists to keep on screen.
+		pumpRunLoop(installWaitTick)
 	}
 	return "", false
 }
 
 const (
-	installWaitTick  = 250 * time.Millisecond
-	installWaitTicks = 24 // six seconds
+	installWaitTick = 250 * time.Millisecond
+	// startWaitTicks is how long to wait for the agent to say ANYTHING.
+	//
+	// Short, because the thing it is detecting is an agent that is not
+	// running, and that answer does not improve by waiting for it.
+	startWaitTicks = 10 * 4 // ten seconds
+	// installWaitTicks bounds the wait at twenty minutes.
+	//
+	// It was six seconds, from when this loop only had to catch a result
+	// that either arrived or did not. Now it is drawing the progress bar,
+	// and giving up after six seconds would take the bar off the screen a
+	// few percent into every large application — which is the moment
+	// somebody most wants to look at it.
+	//
+	// Still bounded, because the agent may not be running at all, in which
+	// case no answer is ever coming. Twenty minutes matches the timeout the
+	// agent puts on running an installer package, so this outlives the work
+	// rather than the other way round.
+	installWaitTicks = 20 * 60 * 4
 )
+
+// drawInstallProgress moves the bar to wherever the agent says it has got.
+//
+// Silent when there is nothing to report: an install that has not begun, or
+// has just finished, leaves the file empty, and the bar stays where it was
+// rather than snapping to zero.
+// It reports whether the agent said anything at all, which is what tells the
+// caller that work has actually begun.
+func drawInstallProgress() bool {
+	p, ok := agentstatus.ReadInstallProgress()
+	if !ok {
+		return false
+	}
+
+	// Percent is -1 when the agent could not measure the work. Passed
+	// straight through: the bar goes back to sweeping, which is the honest
+	// picture, rather than sitting at a number nobody computed.
+	progressUpdate(p.Percent, progressWords(p))
+	return true
+}
+
+// progressWords is the line under the bar.
+//
+// The phase where the thing doing the work names one — an installer package
+// says "Preparing the disk…" and that is better than any sentence written
+// here. Sizes otherwise, because "148 MB of 412 MB" answers the question a
+// percentage does not: how much longer.
+func progressWords(p agentstatus.InstallProgress) string {
+	if p.Phase != "" {
+		return p.Phase
+	}
+	if p.Total > 0 {
+		return fmt.Sprintf("%s of %s", humanBytes(p.Done), humanBytes(p.Total))
+	}
+	return "This will not ask you for a password."
+}
+
+// humanBytes is a size somebody can read at a glance.
+//
+// Decimal units, matching Finder. A bar that says 412 MB beside a Finder
+// window saying 432 MB about the same file invites the question of which one
+// is wrong, and the answer — that one of them counted in units of 1024 — is
+// of no use to anybody waiting for a copy.
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1_000_000_000:
+		return fmt.Sprintf("%.1f GB", float64(n)/1e9)
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.0f MB", float64(n)/1e6)
+	case n >= 1_000:
+		return fmt.Sprintf("%.0f KB", float64(n)/1e3)
+	default:
+		return fmt.Sprintf("%d bytes", n)
+	}
+}
 
 // sendInstallRequest raises the approval request and says what happened.
 //
@@ -360,11 +508,60 @@ func appNameOf(row softwareRow) string {
 // into an unbounded stack of dialogs, and would find out from a user.
 var askingNow bool
 
+// showCheckingPanel keeps a panel up while the agent is still working out
+// what a freshly mounted image contains, and takes it down when it is done.
+//
+// This is the gap between double-clicking a disk image and being told
+// anything. It is not short: the agent will not judge a half-mounted bundle,
+// so it waits for the same answer twice, and a Mac that says nothing for
+// those seconds has — from where the person is sitting — ignored the
+// double-click entirely. They go looking in Finder and meet the password
+// sheet, which is the one thing this feature exists to prevent.
+//
+// Driven from the refresh tick rather than by waiting: the panel goes up on
+// the tick that sees a checking row and comes down on the tick that does
+// not. If the answer settles inside one tick nothing is ever shown, which is
+// right — there was nothing to wait for.
+func showCheckingPanel(rows []softwareRow) {
+	// Never on top of a dialog. A floating panel over a question somebody is
+	// reading is a panel covering the thing they have to answer.
+	if askingNow {
+		return
+	}
+	for _, r := range rows {
+		if r.stage != stageChecking {
+			continue
+		}
+		name := appNameOf(r)
+		if name == "" {
+			name = "this disk image"
+		}
+		progressShow("Checking "+name,
+			"Making sure it is allowed before installing it.")
+		checkingPanelUp = true
+		return
+	}
+	if checkingPanelUp {
+		progressHide()
+		checkingPanelUp = false
+	}
+}
+
+// checkingPanelUp is whether THIS panel is the one on screen, so the install
+// panel is never torn down by the checking tick that follows it.
+var checkingPanelUp bool
+
 // askAboutNewInstalls puts the question in front of somebody who has just
 // opened a disk image, rather than waiting for them to find the menu.
 func askAboutNewInstalls(rows []softwareRow) {
 	if askingNow {
 		return
+	}
+	// A question replaces the panel. Asking from underneath it would be a
+	// dialog somebody cannot read.
+	if checkingPanelUp {
+		progressHide()
+		checkingPanelUp = false
 	}
 	row, ok := installPromptState.next(rows)
 	if !ok {
@@ -412,6 +609,26 @@ func askAboutNewInstalls(rows []softwareRow) {
 			return
 		}
 		installNow(row)
+		return
+	}
+
+	// Forbidden by a rule: a statement, and no request.
+	//
+	// Checked before the requestable wording below, which would otherwise
+	// promise that somebody has been asked. Nobody has, and nobody will be:
+	// the agent stopped raising requests against a rule because the portal
+	// refuses to approve them, so the request was only ever a dead letter
+	// that left the person waiting for an answer that was never coming.
+	//
+	// What they are told instead is the thing they can act on — who to go
+	// to, and that the rule itself has to change.
+	if row.blocked {
+		showText(name+" is not allowed on this Mac",
+			row.detailWithoutClickHint()+"\n\n"+
+				"No approval request has been raised, and asking again here "+
+				"will not change it: this is a policy rule, and nobody can "+
+				"approve an exception to one. If you need "+name+" for your "+
+				"work, ask whoever manages this Mac to change the rule.")
 		return
 	}
 

@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // The same application must appear once, with everything it offers.
 //
@@ -84,5 +87,90 @@ func TestTheImageJustOpenedStaysFirst(t *testing.T) {
 	})
 	if len(apps) != 2 || apps[0].name != "Claude" {
 		t.Errorf("the first entry is %v", apps)
+	}
+}
+
+// Software a policy RULE forbids says so, and says nothing about signatures.
+//
+// A blocked row is not requestable, and "not requestable" used to fall
+// through to the unverified wording. That sent somebody whose organisation
+// had deliberately forbidden an application off hunting for a signature
+// problem that does not exist, while the thing they could actually act on —
+// get the rule changed — was never said.
+func TestBlockedSoftwareSaysItIsBlockedRatherThanUnverifiable(t *testing.T) {
+	label, enabled := actionFor(softwareRow{
+		name: "Claude", title: "Claude", blocked: true,
+	})
+	if enabled {
+		t.Error("a blocked row was clickable; there is nothing it can do")
+	}
+	if strings.Contains(strings.ToLower(label), "verif") {
+		t.Fatalf("a blocked application is described as unverifiable (%q) — the "+
+			"signature is fine, the organisation said no", label)
+	}
+	if !strings.Contains(strings.ToLower(label), "block") {
+		t.Errorf("a blocked application does not say it is blocked: %q", label)
+	}
+}
+
+// And the two refusals stay different. An unsigned bundle is not blocked by
+// anybody; telling somebody their organisation forbids it sends them to
+// argue with an administrator who has never heard of the application.
+func TestAnUnverifiableBundleIsNotCalledBlocked(t *testing.T) {
+	label, _ := actionFor(softwareRow{name: "Thing", title: "Thing"})
+	if strings.Contains(strings.ToLower(label), "block") {
+		t.Errorf("an unverifiable bundle is described as blocked: %q", label)
+	}
+}
+
+// While the agent is copying, the menu must not go on offering the copy.
+//
+// A row being installed is STILL installable — the policy has not changed —
+// so every offer branch matches it. Without the stage tested first the menu
+// said "Install" for the whole length of the copy, somebody looked again,
+// saw the same offer, and clicked it a second time.
+func TestWorkInProgressIsNotOfferedAgain(t *testing.T) {
+	for _, c := range []struct {
+		what string
+		row  softwareRow
+		want string
+	}{
+		{"installing", softwareRow{name: "Slack", installable: true, stage: stageInstalling}, "Installing"},
+		{"updating", softwareRow{name: "Slack", installable: true, updates: true, stage: stageInstalling}, "Updating"},
+		{"checking", softwareRow{name: "Slack", stage: stageChecking}, "Checking"},
+	} {
+		label, enabled := actionFor(c.row)
+		if enabled {
+			t.Errorf("%s: the row is still clickable, so it can be started twice", c.what)
+		}
+		if !strings.HasPrefix(label, c.want) {
+			t.Errorf("%s: label is %q, want it to start with %q", c.what, label, c.want)
+		}
+	}
+}
+
+// Replacing a version somebody is using is an UPDATE, and a menu that says
+// "Installing" about it reads as a second copy being added beside the first.
+func TestReplacingAVersionSaysUpdatingNotInstalling(t *testing.T) {
+	label, _ := actionFor(softwareRow{
+		name: "Slack", installable: true, updates: true, stage: stageInstalling,
+	})
+	if strings.Contains(label, "Install") {
+		t.Errorf("replacing an installed version is described as installing: %q", label)
+	}
+}
+
+// A settled row is unaffected: the stage is empty and the ordinary offers
+// still come through. Without this the two cases above could be satisfied by
+// a switch that never offers anything at all.
+func TestASettledRowStillOffersItsAction(t *testing.T) {
+	if label, enabled := actionFor(softwareRow{name: "Slack", installable: true}); !enabled ||
+		label != "Install" {
+		t.Errorf("a settled installable row offers %q (enabled=%v), want Install", label, enabled)
+	}
+	if label, enabled := actionFor(softwareRow{
+		name: "Slack", installable: true, updates: true,
+	}); !enabled || label != "Update" {
+		t.Errorf("a settled update row offers %q (enabled=%v), want Update", label, enabled)
 	}
 }

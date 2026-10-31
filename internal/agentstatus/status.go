@@ -89,11 +89,33 @@ type PendingInstall struct {
 	Rule    string `json:"rule,omitempty"`
 	Policy  string `json:"policy,omitempty"`
 
-	// Installing and LastError describe an attempt in progress or just
-	// finished, so a person who pressed the button sees something happen.
-	Installing bool   `json:"installing,omitempty"`
-	LastError  string `json:"last_error,omitempty"`
+	// Stage is work the agent is doing about this row RIGHT NOW, as opposed
+	// to Outcome, which is what it decided.
+	//
+	// It exists because both of those take time that somebody is standing
+	// there watching. Opening a disk image is followed by two full scans
+	// before any answer is published — deliberately, so a half-mounted
+	// bundle cannot be judged — and installing is a copy that can run for a
+	// minute. Neither used to show anything at all, so the honest reading of
+	// the menu was that double-clicking the image had done nothing.
+	//
+	// One of StageChecking, StageInstalling, or empty for a settled row.
+	Stage string `json:"stage,omitempty"`
+
+	// LastError describes an attempt that just finished badly.
+	LastError string `json:"last_error,omitempty"`
 }
+
+// What the agent is in the middle of doing about one row.
+const (
+	// StageChecking: the image is mounted and the answer is not settled.
+	// Carries no Outcome and no Reason — there is not one yet, and
+	// publishing a provisional one is how somebody came to be shown "needs
+	// approval" for software an operator had allowed.
+	StageChecking = "checking"
+	// StageInstalling: the agent is copying or running it now.
+	StageInstalling = "installing"
+)
 
 // Status is what the agent publishes about itself.
 type Status struct {
